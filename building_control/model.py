@@ -31,6 +31,19 @@ class RoomConfig:
     rated_input_kw: float = 3.0
     gain_kw_per_c: float = 2.0
 
+    @property
+    def comfort_low_c(self) -> float:
+        return self.setpoint_c - self.deadband_c
+
+    @property
+    def comfort_high_c(self) -> float:
+        return self.setpoint_c + self.deadband_c
+
+    def in_comfort_band(self, temperature_c: float | None) -> bool:
+        if temperature_c is None:
+            return False
+        return self.comfort_low_c <= temperature_c <= self.comfort_high_c
+
     def demand(self, temperature_c: float | None) -> Mode:
         if temperature_c is None:
             return Mode.UNKNOWN
