@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Callable
 
 from .model import Mode, RoomConfig, RoomState, SensorStatus
-from .planner import Allocation, ControlPlan, Planner
+from .planner import ControlPlan, Delivery, Planner
 from .plant import EquipmentMode, HeatPump
 from .sensing import Measurement, SensorRegistry
 
@@ -20,12 +20,29 @@ class TickResult:
     previous_mode: EquipmentMode
     applied_mode: EquipmentMode
     rooms: tuple[RoomState, ...]
+    deliveries: tuple[Delivery, ...]
     degraded: bool
     conservative_shutdown: bool
+    equipment_available: bool
+    unavailable_remaining_s: float
     lockout_remaining_s: float
 
     def allocation_for(self, room_id: str):
         return self.plan.allocated_for(room_id)
+
+    def delivery_for(self, room_id: str):
+        for delivery in self.deliveries:
+            if delivery.room_id == room_id:
+                return delivery
+        return None
+
+    @property
+    def unmet_reasons(self) -> tuple[str, ...]:
+        return tuple(
+            f"{delivery.room_id}: {reason}"
+            for delivery in self.deliveries
+            for reason in delivery.reasons
+        )
 
 
 class BuildingEngine:
@@ -86,10 +103,21 @@ class BuildingEngine:
         degraded = any(room.sensor_status is not SensorStatus.FRESH for room in room_states)
         any_valid_demand = any(room.is_known_demand for room in room_states)
         target = plan.desired_mode if any_valid_demand else EquipmentMode.OFF
+        transition_target = target
+        if (
+            any_valid_demand
+            and target.running
+            and self.equipment.mode.running
+            and target is not self.equipment.mode
+            and self.equipment.can_turn_off(current)
+        ):
+            transition_target = EquipmentMode.OFF
 
-        if self.equipment.allow(target, current):
-            self.equipment.apply(target, current)
+        if self.equipment.allow(transition_target, current):
+            self.equipment.apply(transition_target, current)
         applied_mode = self.equipment.mode
+
+        deliveries = self._deliver(room_states, plan, applied_mode, current)
 
         return TickResult(
             timestamp=current,
@@ -97,10 +125,70 @@ class BuildingEngine:
             previous_mode=previous_mode,
             applied_mode=applied_mode,
             rooms=tuple(room_states),
+            deliveries=tuple(deliveries),
             degraded=degraded,
             conservative_shutdown=not any_valid_demand,
+            equipment_available=self.equipment.is_available(current),
+            unavailable_remaining_s=self.equipment.unavailable_remaining_s(current),
             lockout_remaining_s=self.equipment.remaining_lockout_s(current),
         )
+
+    def _deliver(
+        self,
+        room_states: list[RoomState],
+        plan: ControlPlan,
+        applied_mode: EquipmentMode,
+        now: float,
+    ) -> list[Delivery]:
+        deliveries: list[Delivery] = []
+        available = self.equipment.is_available(now)
+
+        for room in room_states:
+            if not room.is_known_demand:
+                continue
+
+            allocation = plan.allocated_for(room.room_id)
+            planned_kw = allocation.allocated_kw if allocation is not None else 0.0
+            reasons: list[str] = []
+
+            if not available:
+                reasons.append("设备临时故障/不可用，本周期无实际输出")
+            elif room.demand.value != plan.desired_mode.value:
+                if plan.desired_mode.running:
+                    reasons.append(
+                        f"模式冲突：本周期执行 {plan.desired_mode.value}，{room.demand.value} 需求不供给"
+                    )
+                else:
+                    reasons.append("本周期计划停机，需求不供给")
+            elif room.demand.value != applied_mode.value:
+                if applied_mode is EquipmentMode.OFF:
+                    reasons.append("设备仍处于最短停机等待，计划供能尚未成为实际输出")
+                else:
+                    reasons.append(
+                        f"设备仍保持 {applied_mode.value}，模式切换/最短开机等待未结束"
+                    )
+
+            delivered_kw = planned_kw if not reasons else 0.0
+            if room.requested_kw > delivered_kw + 1e-9 and available:
+                capacity_shortfall = room.requested_kw - max(planned_kw, delivered_kw)
+                if capacity_shortfall > 1e-9 and not any(
+                    "模式" in reason or "等待" in reason for reason in reasons
+                ):
+                    reasons.append(
+                        f"设备能力不足，尚有 {capacity_shortfall:.3g}kW 需求未满足"
+                    )
+
+            deliveries.append(
+                Delivery(
+                    room_id=room.room_id,
+                    mode=room.demand,
+                    requested_kw=room.requested_kw,
+                    planned_kw=planned_kw,
+                    delivered_kw=delivered_kw,
+                    reasons=tuple(reasons),
+                )
+            )
+        return deliveries
 
     def save_state(self, path: str | Path) -> None:
         payload = {

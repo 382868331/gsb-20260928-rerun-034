@@ -17,6 +17,8 @@ class LocalRoomModel:
     ambient_c: float = 10.0
     thermal_capacity_kj_per_c: float = 50.0
     thermal_resistance_c_per_kw: float = 4.0
+    heating_energy_kwh: float = 0.0
+    cooling_energy_kwh: float = 0.0
 
     def step(self, dt_s: float, heat_input_kw: float = 0.0, cool_input_kw: float = 0.0) -> float:
         if heat_input_kw and cool_input_kw:
@@ -26,5 +28,7 @@ class LocalRoomModel:
             (self.ambient_c - self.temperature_c) / self.thermal_resistance_c_per_kw
         )
         net_kw = conductive_kw + heat_input_kw - cool_input_kw
+        self.heating_energy_kwh += heat_input_kw * dt_h
+        self.cooling_energy_kwh += cool_input_kw * dt_h
         self.temperature_c += net_kw * dt_h * 3600.0 / self.thermal_capacity_kj_per_c
         return self.temperature_c

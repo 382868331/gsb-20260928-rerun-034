@@ -6,7 +6,7 @@
 
 from .model import Mode, RoomConfig, RoomState, SensorStatus
 from .plant import EquipmentMode, HeatPump, HeatPumpSpec
-from .planner import Allocation, ControlPlan, Planner
+from .planner import Allocation, ControlPlan, Delivery, Planner
 from .engine import BuildingEngine, TickResult
 from .sensing import Measurement
 
@@ -20,6 +20,7 @@ __all__ = [
     "HeatPumpSpec",
     "Allocation",
     "ControlPlan",
+    "Delivery",
     "Planner",
     "BuildingEngine",
     "TickResult",

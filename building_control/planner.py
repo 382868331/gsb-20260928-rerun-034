@@ -17,6 +17,20 @@ class Allocation:
 
 
 @dataclass(frozen=True)
+class Delivery:
+    room_id: str
+    mode: Mode
+    requested_kw: float
+    planned_kw: float
+    delivered_kw: float
+    reasons: tuple[str, ...] = field(default_factory=tuple)
+
+    @property
+    def unmet_kw(self) -> float:
+        return max(0.0, self.requested_kw - self.delivered_kw)
+
+
+@dataclass(frozen=True)
 class ControlPlan:
     desired_mode: EquipmentMode
     allocations: tuple[Allocation, ...] = field(default_factory=tuple)
@@ -81,4 +95,12 @@ class Planner:
                     allocated_kw=allocated,
                 )
             )
+
+        shortfall = tuple(
+            f"{allocation.room_id} 缺 {allocation.requested_kw - allocation.allocated_kw:.3g}kW"
+            for allocation in allocations
+            if allocation.requested_kw > allocation.allocated_kw + 1e-9
+        )
+        if shortfall:
+            notes += (f"设备能力不足：{'; '.join(shortfall)}",)
         return ControlPlan(equipment_mode, tuple(allocations), notes)

@@ -36,6 +36,26 @@ class HeatPump:
         self.spec = spec
         self.mode = EquipmentMode.OFF
         self.state_since = now
+        self.fault_until: float | None = None
+
+    def is_available(self, now: float) -> bool:
+        return self.fault_until is None or now >= self.fault_until
+
+    def unavailable_remaining_s(self, now: float) -> float:
+        if self.fault_until is None:
+            return 0.0
+        return max(0.0, self.fault_until - now)
+
+    def report_fault(self, until: float, now: float) -> None:
+        if until <= now:
+            raise ValueError("故障结束时间必须晚于当前时间")
+        if self.mode.running:
+            self.mode = EquipmentMode.OFF
+            self.state_since = now
+        self.fault_until = until
+
+    def clear_fault(self) -> None:
+        self.fault_until = None
 
     def capacity_kw(self, mode: EquipmentMode) -> float:
         if mode is EquipmentMode.HEAT:
@@ -54,6 +74,8 @@ class HeatPump:
         return self.mode is EquipmentMode.OFF and self._elapsed(now) >= self.spec.min_off_s
 
     def allow(self, target: EquipmentMode, now: float) -> bool:
+        if not self.is_available(now):
+            return False
         if target is self.mode:
             return True
         if target is EquipmentMode.OFF:
@@ -77,8 +99,14 @@ class HeatPump:
         return max(0.0, self.spec.min_off_s - self._elapsed(now))
 
     def snapshot(self) -> dict[str, object]:
-        return {"mode": self.mode.value, "state_since": self.state_since}
+        return {
+            "mode": self.mode.value,
+            "state_since": self.state_since,
+            "fault_until": self.fault_until,
+        }
 
     def restore(self, data: dict[str, object]) -> None:
         self.mode = EquipmentMode(str(data["mode"]))
         self.state_since = float(data["state_since"])  # type: ignore[arg-type]
+        fault_until = data.get("fault_until")
+        self.fault_until = None if fault_until is None else float(fault_until)
