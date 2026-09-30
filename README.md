@@ -1,43 +1,32 @@
-# 智能建筑控制引擎（Python 起步）
+# 智能建筑控制引擎（Python）
 
-当前迭代只实现**多房间共用一台冷暖设备时的温度控制**，使用简化的本地房间模型。
-照明与能耗策略是后续迭代，分层结构已为其预留扩展点。
+本迭代支持多个房间共用**多台能力不同的冷热设备**，并处理冷热模式冲突、逐设备最短开停机、
+逐设备故障、按时段变化的总功率上限、实际供能账目以及保存/恢复。
 
 ## 架构
 
 | 模块 | 职责 |
 | --- | --- |
-| `building_control/model.py` | 房间配置（`RoomConfig`）、房间状态（`RoomState`）、需求模式（`Mode`）与传感器状态（`SensorStatus`） |
-| `building_control/plant.py` | 共用冷暖设备 `HeatPump`：冷热能力、最短开机/停机时间、禁止冷热直接互切 |
-| `building_control/sensing.py` | `Measurement` 测量值与 `SensorRegistry`：超时断流判定 |
-| `building_control/planner.py` | 控制计划 `ControlPlan`：冷热冲突仲裁 + 有限能力按优先级分配 + 未满足需求 `UnmetDemand` 账目 |
-| `building_control/engine.py` | `BuildingEngine`：测量汇集、计划生成、**实际能量交付**（计划 vs 实际）、未满足原因、状态保存/恢复 |
-| `building_control/simulation.py` | 简化本地集总参数房间热模型 `LocalRoomModel` |
-| `demo.py` | 冷热需求相反的两房间端到端演示 |
-| `tests/test_control.py` | 全部验收点测试 |
+| `building_control/model.py` | 房间配置、房间状态、需求方向与传感器状态 |
+| `building_control/plant.py` | `HeatPumpSpec/HeatPump` 和 `EquipmentFleet`：单机能力、故障、逐设备最短开/停，设备组禁止同时冷热 |
+| `building_control/schedule.py` | `PowerLimit/PowerSchedule`：按时段查询制热/制冷总功率上限 |
+| `building_control/planner.py` | 冷热冲突仲裁、优先级分配、计划分配与未满足功率 |
+| `building_control/accounting.py` | `EnergyLedger/RoomEnergy`：只累计真实交付功率形成的能量账目 |
+| `building_control/engine.py` | 执行设备轮换、交付真实功率、解释未满足原因、持久化设备/传感器/账目状态 |
+| `building_control/sensing.py` | 最近测量与断流判定 |
+| `building_control/simulation.py` | 简化本地房间热模型 |
+| `demo.py` | 双机正常、限电、单机故障恢复和冷热切换演示 |
+| `tests/test_control.py` | 验收测试 |
 
 ## 核心策略
 
-- **冲突仲裁**：有冷热需求时，设备只能运行一种模式；`priority` 数值最小的房间决定模式，
-  相反需求房间本周期不供给，仲裁原因写入 `ControlPlan.notes`。
-- **有限能力分配**：同模式需求房间按优先级排序，逐房间分配换热功率，
-  超出设备能力的低优先级房间拿到 0。
-- **计划量 ≠ 实际输出**：`ControlPlan.allocations` 只是“想供多少”；
-  `TickResult.delivered` 才是设备按**当前真实运行模式**交付的能量，房间热模型只能消费它。
-  最短开/停等待、模式切换、故障期间 `delivered` 为空（或为 0），绝不把计划量记成房间能量。
-- **最短开/停时间**：`HeatPump.allow()` 是唯一的切换闸口。未满足最短开机时间不能停机，
-  未满足最短停机时间不能启动；制热/制冷不能直接互切，引擎先把设备置回 `OFF`，
-  等最短停机结束后再起新模式。等待期间需求保留，但不产生任何冷热能量。
-- **临时故障与重新分配**：`HeatPump.set_available(False, t)` 表示设备故障急停，
-  本周期所有需求进入 `UnmetDemand(reason="equipment_faulted")`；故障恢复后仍须满足
-  最短停机（从急停时刻计），等待结束才重新按优先级分配能力给各房间。
-- **未满足需求账目**：`TickResult.unmet` 逐条记录 `room_id / mode / requested_kw / unmet_kw / reason`，
-  原因包括 `mode_conflict`（冷热冲突）、`min_off_not_satisfied`（停机/切换等待）、
-  `capacity_exceeded`（能力不足）、`equipment_faulted`（设备故障），缺多少功率就报多少。
-- **传感器断流保守状态**：读数超过 `sensor_stale_after_s` 未更新即 `STALE`，从未上报为 `NEVER`；
-  两种状态下温度显式为 `None`、需求为 `Mode.UNKNOWN`，绝不复用旧读数，设备不被未知需求驱动。
-- **状态持久化**：`save_state/restore` 保存设备模式、`state_since`、故障标志 `available`
-  （以及最近测量时间戳），进程重启后等待时间与故障状态不重置、不会被跳过。
+- **双机/多机不反向同供**：`EquipmentFleet` 在任一时刻只允许统一为制热、制冷或停机；新模式启动前，相反模式设备必须先停机。
+- **逐设备最短约束**：每台设备单独保存 `mode/state_since/available`，设备轮换或故障急停不会重置其他设备的等待计时。
+- **按时段限电**：`PowerSchedule.limit_kw(mode, t)` 取得当前总功率上限；计划和真实交付都取设备能力与外部功率上限的较小值，限电缺口记为 `power_limit_exceeded`。
+- **故障后重新分配**：单台设备故障立即急停，其他可运行设备继续服务并按房间优先级重新分配；故障设备恢复后仍要完成自己的最短停机等待。
+- **计划不等于交付**：最短开/停机、冷热切换、设备故障、限电等情况下，只有 `TickResult.delivered` 中存在的功率可进入房间热模型和 `EnergyLedger`。
+- **未满足原因**：包括 `mode_conflict`、`min_on_not_satisfied`、`min_off_not_satisfied`、`capacity_exceeded`、`power_limit_exceeded`、`equipment_faulted`。
+- **重启一致性**：状态文件保存每台设备状态、最近测量、时段计划、上次 tick、上次实际交付功率和累计能量；恢复后等待计时与继续积分结果与连续运行一致。
 
 ## 运行
 
@@ -45,9 +34,3 @@
 .venv/bin/python demo.py
 .venv/bin/python -m pytest tests/ -q
 ```
-
-## 后续扩展
-
-- 照明：新增独立的 `LightingPlan`/执行器，与温度计划在引擎层并列。
-- 能耗策略：在 `Planner` 与设备能力之间增加预算约束与削峰策略。
-- 更真实的房间/气象模型：替换 `simulation.LocalRoomModel`，引擎接口不变。

@@ -1,12 +1,14 @@
 """智能建筑控制引擎（Python 起步版本）。
 
-当前范围：多个房间共用一台冷暖设备时的温度控制。
+当前范围：多个房间共用多台不同能力的冷暖设备时的温度控制。
 照明与能耗策略在后续迭代加入。
 """
 
 from .model import Mode, RoomConfig, RoomState, SensorStatus
-from .plant import EquipmentMode, HeatPump, HeatPumpSpec
+from .accounting import EnergyLedger, RoomEnergy
+from .plant import EquipmentFleet, EquipmentMode, HeatPump, HeatPumpSpec
 from .planner import Allocation, ControlPlan, Planner, UnmetDemand
+from .schedule import PowerLimit, PowerSchedule
 from .engine import BuildingEngine, TickResult
 from .sensing import Measurement
 
@@ -16,8 +18,13 @@ __all__ = [
     "RoomState",
     "SensorStatus",
     "EquipmentMode",
+    "EquipmentFleet",
     "HeatPump",
     "HeatPumpSpec",
+    "PowerLimit",
+    "PowerSchedule",
+    "EnergyLedger",
+    "RoomEnergy",
     "Allocation",
     "UnmetDemand",
     "ControlPlan",

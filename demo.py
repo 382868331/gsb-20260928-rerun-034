@@ -1,11 +1,14 @@
-"""端到端演示：冷热需求相反的两个房间共用一台冷暖设备。"""
+"""端到端演示：两台不同能力的设备共同服务多个房间。"""
 
 from building_control import (
     BuildingEngine,
+    EquipmentFleet,
     HeatPump,
     HeatPumpSpec,
     Measurement,
     Mode,
+    PowerLimit,
+    PowerSchedule,
     RoomConfig,
 )
 from building_control.simulation import LocalRoomModel
@@ -16,17 +19,29 @@ def main() -> None:
         RoomConfig(room_id="r1", name="主卧", priority=1, setpoint_c=22.0),
         RoomConfig(room_id="r2", name="客厅", priority=2, setpoint_c=22.0),
     ]
-    spec = HeatPumpSpec(
-        name="屋顶热泵-1",
-        heating_capacity_kw=5.0,
-        cooling_capacity_kw=5.0,
-        min_on_s=300.0,
-        min_off_s=180.0,
+    specs = [
+        HeatPumpSpec(
+            device_id="hp-small",
+            name="小热泵",
+            heating_capacity_kw=2.0,
+            cooling_capacity_kw=2.0,
+            min_on_s=300.0,
+            min_off_s=180.0,
+        ),
+        HeatPumpSpec(
+            device_id="hp-large",
+            name="大热泵",
+            heating_capacity_kw=4.0,
+            cooling_capacity_kw=4.0,
+            min_on_s=300.0,
+            min_off_s=180.0,
+        ),
+    ]
+    fleet = EquipmentFleet(
+        [HeatPump(specs[0], now=-10_000.0), HeatPump(specs[1], now=-20_000.0)]
     )
-    # 设备一开始处于临时故障，演示故障恢复与重新分配。
-    equipment = HeatPump(spec, now=-10_000.0)
-    equipment.set_available(False, now=-10_000.0)
-    engine = BuildingEngine(rooms, equipment, sensor_stale_after_s=120.0)
+    schedule = PowerSchedule([PowerLimit(300.0, 600.0, heating_kw=3.0, cooling_kw=3.0)])
+    engine = BuildingEngine(rooms, fleet, sensor_stale_after_s=120.0, power_schedule=schedule)
 
     sims = {
         "r1": LocalRoomModel("r1", temperature_c=16.0, ambient_c=8.0),
@@ -34,12 +49,13 @@ def main() -> None:
     }
 
     dt_s = 60.0
-    energy_kwh = {"r1": 0.0, "r2": 0.0}
     for step in range(16):
         t = step * dt_s
-        if step == 2:  # 120s 故障排除
-            equipment.set_available(True, t)
-        if step == 9:  # 540s 起主卧也要求制冷，进入 HEAT→OFF 等待→COOL
+        if step == 3:
+            fleet.set_available(False, t, "hp-large")
+        if step == 6:
+            fleet.set_available(True, t, "hp-large")
+        if step == 9:
             sims["r1"].temperature_c = 30.0
             sims["r1"].ambient_c = 34.0
         for room_id, sim in sims.items():
@@ -47,38 +63,29 @@ def main() -> None:
         result = engine.tick(t)
 
         for room_id, sim in sims.items():
-            # 只按设备“实际交付”的能量记账，计划量在等待/故障期间为 0。
             delivered = result.allocation_for(room_id)
             heat = delivered.allocated_kw if delivered and delivered.mode is Mode.HEAT else 0.0
             cool = delivered.allocated_kw if delivered and delivered.mode is Mode.COOL else 0.0
-            energy_kwh[room_id] += (heat - cool) * dt_s / 3600.0
             sim.step(dt_s, heat_input_kw=heat, cool_input_kw=cool)
 
-        plan_mode = result.plan.desired_mode.value
-        actual_mode = result.delivered_mode.value
-        flag = ""
-        if result.delivered_mode is not result.plan.desired_mode:
-            wait = f"，剩余等待 {result.lockout_remaining_s:.0f}s" if result.lockout_remaining_s else ""
-            flag = f"  计划={plan_mode} 但实际交付=off（{_reason_text(result)}{wait}）"
+        device_text = ", ".join(f"{id_}={mode.value}" for id_, mode in result.device_modes)
+        limit_text = f"/{result.total_power_limit_kw:.0f}kW" if result.delivered_mode.running else ""
+        accounts = dict(result.energy)
         temps = ", ".join(
-            f"{rid}={sim.temperature_c:.2f}℃/净能量{energy_kwh[rid]:+.2f}kWh"
+            f"{rid}={sim.temperature_c:.2f}℃/累计{accounts[rid].total_kwh:+.2f}kWh"
+            if rid in accounts
+            else f"{rid}={sim.temperature_c:.2f}℃/累计+0.00kWh"
             for rid, sim in sims.items()
         )
-        print(f"t={t:6.0f}s 设备={actual_mode:4s} {temps}{flag}")
+        print(
+            f"t={t:6.0f}s 交付={result.delivered_mode.value:4s}{limit_text} "
+            f"[{device_text}] {temps}"
+        )
         for item in result.unmet:
             print(
                 f"         未满足: {item.room_id} 需{item.mode.value} "
                 f"{item.requested_kw:.1f}kW，缺 {item.unmet_kw:.1f}kW（{item.reason}）"
             )
-
-
-def _reason_text(result) -> str:
-    reasons = {item.reason for item in result.unmet}
-    if "equipment_faulted" in reasons:
-        return "设备临时故障"
-    if "min_off_not_satisfied" in reasons:
-        return "最短停机/切换等待未结束"
-    return "模式冲突或未运行"
 
 
 if __name__ == "__main__":

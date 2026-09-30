@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .model import Mode, RoomState
-from .plant import EquipmentMode, HeatPump
+from .plant import EquipmentMode, EquipmentFleet, HeatPump
 
 
 @dataclass(frozen=True)
@@ -14,6 +14,8 @@ class Allocation:
     mode: Mode
     requested_kw: float
     allocated_kw: float
+    device_id: str | None = None
+    device_allocations: tuple[tuple[str, float], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -42,7 +44,7 @@ class UnmetDemand:
 
 
 class Planner:
-    def __init__(self, equipment: HeatPump) -> None:
+    def __init__(self, equipment: HeatPump | EquipmentFleet) -> None:
         self.equipment = equipment
 
     @staticmethod
@@ -102,7 +104,13 @@ class Planner:
                 )
         return tuple(allocations), tuple(unmet)
 
-    def plan(self, rooms: list[RoomState]) -> ControlPlan:
+    def plan(
+        self,
+        rooms: list[RoomState],
+        now: float = 0.0,
+        heating_cap_kw: float | None = None,
+        cooling_cap_kw: float | None = None,
+    ) -> ControlPlan:
         winner, notes = self.arbitrate(rooms)
         unmet: list[UnmetDemand] = []
         for room in sorted(rooms, key=lambda r: r.config.priority):
@@ -122,6 +130,18 @@ class Planner:
         if winner is Mode.OFF:
             return ControlPlan(EquipmentMode.OFF, (), notes, tuple(unmet))
         equipment_mode = EquipmentMode(winner.value)
-        capacity = self.equipment.capacity_kw(equipment_mode)
+        fleet = self._fleet()
+        equipment_capacity = fleet.capacity_kw(equipment_mode, now)
+        external_cap = (
+            heating_cap_kw if winner is Mode.HEAT else cooling_cap_kw
+        )
+        capacity = equipment_capacity if external_cap is None else min(
+            equipment_capacity, external_cap
+        )
         allocations, capacity_unmet = self.allocate(rooms, winner, capacity)
         return ControlPlan(equipment_mode, allocations, notes, tuple(unmet) + capacity_unmet)
+
+    def _fleet(self) -> EquipmentFleet:
+        if isinstance(self.equipment, EquipmentFleet):
+            return self.equipment
+        return EquipmentFleet([self.equipment])

@@ -2,19 +2,22 @@ import pytest
 
 from building_control import (
     BuildingEngine,
+    EquipmentFleet,
     EquipmentMode,
     HeatPump,
     HeatPumpSpec,
     Measurement,
     Mode,
+    PowerLimit,
+    PowerSchedule,
     RoomConfig,
     SensorStatus,
 )
 
 
-def make_spec(min_on=600.0, min_off=300.0, heat=5.0, cool=5.0):
+def make_spec(name="hp1", min_on=600.0, min_off=300.0, heat=5.0, cool=5.0):
     return HeatPumpSpec(
-        name="hp1",
+        name=name,
         heating_capacity_kw=heat,
         cooling_capacity_kw=cool,
         min_on_s=min_on,
@@ -321,3 +324,97 @@ def test_faulted_state_persists_and_wait_cannot_be_bypassed(tmp_path):
     result = restored.tick(240.0)
     assert result.delivered_mode is EquipmentMode.OFF
     assert result.lockout_remaining_s == pytest.approx(180.0)
+
+
+def test_two_devices_share_demand_until_time_varying_power_limit():
+    rooms = [
+        RoomConfig("r1", "房间1", priority=1, setpoint_c=20.0, rated_input_kw=3.0),
+        RoomConfig("r2", "房间2", priority=2, setpoint_c=20.0, rated_input_kw=3.0),
+        RoomConfig("r3", "房间3", priority=3, setpoint_c=20.0, rated_input_kw=3.0),
+    ]
+    fleet = EquipmentFleet(
+        [
+            HeatPump(make_spec(name="hp-a", heat=3.0, cool=3.0, min_on=0.0, min_off=0.0), -100),
+            HeatPump(make_spec(name="hp-b", heat=5.0, cool=5.0, min_on=0.0, min_off=0.0), -200),
+        ]
+    )
+    schedule = PowerSchedule(
+        [PowerLimit(600.0, 1200.0, heating_kw=4.0, cooling_kw=4.0)]
+    )
+    engine = BuildingEngine(rooms, fleet, power_schedule=schedule)
+    for rid, temp in (("r1", 26), ("r2", 25), ("r3", 24)):
+        engine.ingest(Measurement(rid, temp, 0.0))
+
+    normal = engine.tick(0.0)
+    assert normal.delivered_mode is EquipmentMode.COOL
+    assert sum(a.allocated_kw for a in normal.delivered) == pytest.approx(8.0)
+    assert {device_id for device_id, _ in normal.device_modes} == {"hp-a", "hp-b"}
+    assert normal.unmet_for("r3").reason == "capacity_exceeded"
+
+    for rid, temp in (("r1", 26), ("r2", 25), ("r3", 24)):
+        engine.ingest(Measurement(rid, temp, 600.0))
+    limited = engine.tick(600.0)
+    assert limited.total_power_limit_kw == pytest.approx(4.0)
+    assert sum(a.allocated_kw for a in limited.delivered) <= 4.0 + 1e-9
+    assert limited.allocation_for("r1").allocated_kw == pytest.approx(3.0)
+    assert limited.allocation_for("r2").allocated_kw == pytest.approx(1.0)
+    assert limited.unmet_for("r3").reason == "power_limit_exceeded"
+
+
+def test_individual_device_fault_is_reallocated_without_planned_energy():
+    rooms = [
+        RoomConfig("r1", "房间1", priority=1, setpoint_c=20.0, rated_input_kw=4.0),
+        RoomConfig("r2", "房间2", priority=2, setpoint_c=20.0, rated_input_kw=4.0),
+    ]
+    hp_a = HeatPump(make_spec(name="hp-a", cool=3.0, min_on=600.0, min_off=300.0), -1000)
+    hp_b = HeatPump(make_spec(name="hp-b", cool=5.0, min_on=600.0, min_off=300.0), -2000)
+    fleet = EquipmentFleet([hp_a, hp_b])
+    engine = BuildingEngine(rooms, fleet)
+    engine.ingest(Measurement("r1", 26.0, 0.0))
+    engine.ingest(Measurement("r2", 25.0, 0.0))
+    assert engine.tick(0.0).delivered_mode is EquipmentMode.COOL
+
+    engine.ingest(Measurement("r1", 26.0, 300.0))
+    engine.ingest(Measurement("r2", 25.0, 300.0))
+    fleet.set_available(False, 300.0, "hp-a")
+    faulted = engine.tick(300.0)
+
+    assert hp_a.mode is EquipmentMode.OFF
+    assert hp_b.mode is EquipmentMode.COOL
+    assert faulted.delivered_mode is EquipmentMode.COOL
+    assert sum(a.allocated_kw for a in faulted.delivered) <= 5.0 + 1e-9
+    assert all(a.device_id == "hp-b" for a in faulted.delivered if a.allocated_kw > 0)
+    assert faulted.unmet_for("r2").reason == "capacity_exceeded"
+    assert faulted.lockout_remaining_s == pytest.approx(300.0)
+
+
+def test_restart_preserves_individual_waits_and_delivered_energy_ledger(tmp_path):
+    rooms = [RoomConfig("r1", "房间1", priority=1, setpoint_c=20.0, rated_input_kw=3.0)]
+    specs = [
+        make_spec(name="hp-a", cool=2.0, min_on=600.0, min_off=300.0),
+        make_spec(name="hp-b", cool=2.0, min_on=600.0, min_off=300.0),
+    ]
+    fleet = EquipmentFleet(
+        [HeatPump(specs[0], -1000), HeatPump(specs[1], -2000)]
+    )
+    engine = BuildingEngine(rooms, fleet)
+    engine.ingest(Measurement("r1", 26.0, 0.0))
+    engine.tick(0.0)
+    engine.ingest(Measurement("r1", 26.0, 600.0))
+    continuous = engine.tick(600.0)
+    expected_energy = dict(continuous.energy)["r1"].cooling_kwh
+    assert expected_energy == pytest.approx(3.0 * 600.0 / 3600.0)
+    engine.save_state(tmp_path / "state.json")
+
+    restored_fleet = EquipmentFleet(
+        [HeatPump(specs[0], -10000), HeatPump(specs[1], -10000)]
+    )
+    restored = BuildingEngine.restore(tmp_path / "state.json", rooms, restored_fleet)
+    restored.ingest(Measurement("r1", 26.0, 1200.0))
+    restarted = restored.tick(1200.0)
+
+    assert all(device.mode is EquipmentMode.COOL for device in restored_fleet.devices)
+    assert all(device.state_since == pytest.approx(0.0) for device in restored_fleet.devices)
+    assert dict(restarted.energy)["r1"].cooling_kwh == pytest.approx(
+        expected_energy + 3.0 * 600.0 / 3600.0
+    )
