@@ -36,6 +36,25 @@ class HeatPump:
         self.spec = spec
         self.mode = EquipmentMode.OFF
         self.state_since = now
+        self.available = True
+
+    @property
+    def faulted(self) -> bool:
+        return not self.available
+
+    def set_available(self, available: bool, now: float) -> None:
+        """标记设备可用/临时故障。
+
+        故障视为急停：立即回到 OFF，最短停机计时从急停时刻开始；
+        故障恢复不能跳过该等待，也不会重置开关约束。
+        """
+        available = bool(available)
+        if available == self.available:
+            return
+        self.available = available
+        if not available and self.mode is not EquipmentMode.OFF:
+            self.mode = EquipmentMode.OFF
+            self.state_since = now
 
     def capacity_kw(self, mode: EquipmentMode) -> float:
         if mode is EquipmentMode.HEAT:
@@ -54,6 +73,8 @@ class HeatPump:
         return self.mode is EquipmentMode.OFF and self._elapsed(now) >= self.spec.min_off_s
 
     def allow(self, target: EquipmentMode, now: float) -> bool:
+        if not self.available:
+            return target is self.mode
         if target is self.mode:
             return True
         if target is EquipmentMode.OFF:
@@ -77,8 +98,13 @@ class HeatPump:
         return max(0.0, self.spec.min_off_s - self._elapsed(now))
 
     def snapshot(self) -> dict[str, object]:
-        return {"mode": self.mode.value, "state_since": self.state_since}
+        return {
+            "mode": self.mode.value,
+            "state_since": self.state_since,
+            "available": self.available,
+        }
 
     def restore(self, data: dict[str, object]) -> None:
         self.mode = EquipmentMode(str(data["mode"]))
         self.state_since = float(data["state_since"])  # type: ignore[arg-type]
+        self.available = bool(data.get("available", True))

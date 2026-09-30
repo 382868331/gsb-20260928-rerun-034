@@ -21,12 +21,24 @@ class ControlPlan:
     desired_mode: EquipmentMode
     allocations: tuple[Allocation, ...] = field(default_factory=tuple)
     notes: tuple[str, ...] = field(default_factory=tuple)
+    unmet: tuple["UnmetDemand", ...] = field(default_factory=tuple)
 
     def allocated_for(self, room_id: str):
         for allocation in self.allocations:
             if allocation.room_id == room_id:
                 return allocation
         return None
+
+
+@dataclass(frozen=True)
+class UnmetDemand:
+    """房间需求未能被真实满足的账目：缺多少功率、为什么。"""
+
+    room_id: str
+    mode: Mode
+    requested_kw: float
+    unmet_kw: float
+    reason: str
 
 
 class Planner:
@@ -53,32 +65,63 @@ class Planner:
             )
         return winner, notes
 
-    def plan(self, rooms: list[RoomState]) -> ControlPlan:
-        winner, notes = self.arbitrate(rooms)
-        if winner is Mode.OFF:
-            return ControlPlan(EquipmentMode.OFF, (), notes)
-        equipment_mode = EquipmentMode(winner.value)
-        capacity = self.equipment.capacity_kw(equipment_mode)
+    @staticmethod
+    def allocate(
+        rooms: list[RoomState], mode: Mode, capacity_kw: float
+    ) -> tuple[tuple[Allocation, ...], tuple["UnmetDemand", ...]]:
+        """按优先级在同一模式内分配有限能力，并记录每一项未满足需求。"""
 
         eligible = sorted(
-            (
-                room
-                for room in rooms
-                if room.demand is winner and room.sensor_status.name == "FRESH"
-            ),
+            (room for room in rooms if room.demand is mode),
             key=lambda room: room.config.priority,
         )
         allocations: list[Allocation] = []
-        remaining = capacity
+        unmet: list[UnmetDemand] = []
+        remaining = capacity_kw
         for room in eligible:
             allocated = max(0.0, min(room.requested_kw, remaining))
             remaining -= allocated
             allocations.append(
                 Allocation(
                     room_id=room.room_id,
-                    mode=winner,
+                    mode=mode,
                     requested_kw=room.requested_kw,
                     allocated_kw=allocated,
                 )
             )
-        return ControlPlan(equipment_mode, tuple(allocations), notes)
+            shortfall = room.requested_kw - allocated
+            if shortfall > 1e-9:
+                unmet.append(
+                    UnmetDemand(
+                        room_id=room.room_id,
+                        mode=mode,
+                        requested_kw=room.requested_kw,
+                        unmet_kw=shortfall,
+                        reason="capacity_exceeded",
+                    )
+                )
+        return tuple(allocations), tuple(unmet)
+
+    def plan(self, rooms: list[RoomState]) -> ControlPlan:
+        winner, notes = self.arbitrate(rooms)
+        unmet: list[UnmetDemand] = []
+        for room in sorted(rooms, key=lambda r: r.config.priority):
+            if not room.is_known_demand:
+                continue
+            if room.demand is winner:
+                continue
+            unmet.append(
+                UnmetDemand(
+                    room_id=room.room_id,
+                    mode=room.demand,
+                    requested_kw=room.requested_kw,
+                    unmet_kw=room.requested_kw,
+                    reason="mode_conflict",
+                )
+            )
+        if winner is Mode.OFF:
+            return ControlPlan(EquipmentMode.OFF, (), notes, tuple(unmet))
+        equipment_mode = EquipmentMode(winner.value)
+        capacity = self.equipment.capacity_kw(equipment_mode)
+        allocations, capacity_unmet = self.allocate(rooms, winner, capacity)
+        return ControlPlan(equipment_mode, allocations, notes, tuple(unmet) + capacity_unmet)
