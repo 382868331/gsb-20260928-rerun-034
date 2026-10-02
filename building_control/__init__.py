@@ -5,9 +5,16 @@
 """
 
 from .model import Mode, RoomConfig, RoomState, SensorStatus
-from .plant import EquipmentMode, HeatPump, HeatPumpSpec
+from .plant import EquipmentMode, HeatPump, HeatPumpSpec, PowerSchedule
 from .planner import Allocation, ControlPlan, Planner, UnmetDemand
-from .engine import BuildingEngine, TickResult
+from .storage import StorageSpec, ThermalStorage
+from .engine import (
+    BuildingEngine,
+    DeviceTickInfo,
+    StoragePolicy,
+    StorageTickInfo,
+    TickResult,
+)
 from .sensing import Measurement
 
 __all__ = [
@@ -18,6 +25,12 @@ __all__ = [
     "EquipmentMode",
     "HeatPump",
     "HeatPumpSpec",
+    "PowerSchedule",
+    "StorageSpec",
+    "ThermalStorage",
+    "StoragePolicy",
+    "DeviceTickInfo",
+    "StorageTickInfo",
     "Allocation",
     "UnmetDemand",
     "ControlPlan",

@@ -1,4 +1,13 @@
-"""端到端演示：冷热需求相反的两个房间共用一台冷暖设备。"""
+"""端到端演示：两台能力不同的设备 + 冷热储能 + 限电 + 故障恢复 + 双策略对账。
+
+场景（夏季制冷）：
+- 三个房间共用 hp1（5kW）与 hp2（3kW）两台冷热设备，各自有最短开/停等待。
+- 一座冷热双仓缓冲储能：低需求蓄冷，高需求/限电时放冷，充放均有损耗。
+- 600s~1500s 站点限电 4kW，正好压在高需求时段上。
+- 300s 时 hp2 临时故障，480s 恢复，但最短停机未满仍要等。
+- 同一剧本分别用「舒适优先」与「保留应急储备」两种策略运行，对比账目。
+- 中途保存状态并重开，验证储量、等待计时与未满足需求保持连续。
+"""
 
 from building_control import (
     BuildingEngine,
@@ -6,80 +15,129 @@ from building_control import (
     HeatPumpSpec,
     Measurement,
     Mode,
+    PowerSchedule,
     RoomConfig,
+    StoragePolicy,
+    StorageSpec,
+    ThermalStorage,
 )
 from building_control.simulation import LocalRoomModel
 
+DT_S = 60.0
+STEPS = 30  # 30 分钟
+STATE_FILE = "/tmp/building_engine_state.json"
 
-def main() -> None:
+
+def build(policy: StoragePolicy):
     rooms = [
-        RoomConfig(room_id="r1", name="主卧", priority=1, setpoint_c=22.0),
-        RoomConfig(room_id="r2", name="客厅", priority=2, setpoint_c=22.0),
+        RoomConfig(room_id="r1", name="主卧", priority=1, setpoint_c=24.0),
+        RoomConfig(room_id="r2", name="客厅", priority=2, setpoint_c=24.0),
+        RoomConfig(room_id="r3", name="书房", priority=3, setpoint_c=24.0),
     ]
-    spec = HeatPumpSpec(
-        name="屋顶热泵-1",
-        heating_capacity_kw=5.0,
-        cooling_capacity_kw=5.0,
-        min_on_s=300.0,
-        min_off_s=180.0,
+    devices = [
+        HeatPump(HeatPumpSpec("hp1", 5.0, 5.0, min_on_s=300.0, min_off_s=180.0), now=-10_000.0),
+        HeatPump(HeatPumpSpec("hp2", 3.0, 3.0, min_on_s=600.0, min_off_s=300.0), now=-10_000.0),
+    ]
+    storage = ThermalStorage(
+        StorageSpec(
+            name="缓冲罐",
+            heat_capacity_kwh=8.0,
+            cool_capacity_kwh=8.0,
+            max_charge_kw=4.0,
+            max_discharge_kw=4.0,
+            charge_efficiency=0.9,
+            discharge_efficiency=0.9,
+        )
     )
-    # 设备一开始处于临时故障，演示故障恢复与重新分配。
-    equipment = HeatPump(spec, now=-10_000.0)
-    equipment.set_available(False, now=-10_000.0)
-    engine = BuildingEngine(rooms, equipment, sensor_stale_after_s=120.0)
-
+    schedule = PowerSchedule(segments=[(600.0, 4.0), (1500.0, 100.0)])
+    engine = BuildingEngine(
+        rooms,
+        devices,
+        sensor_stale_after_s=120.0,
+        storage=storage,
+        power_schedule=schedule,
+        storage_policy=policy,
+        reserve_fraction=0.5,
+    )
     sims = {
-        "r1": LocalRoomModel("r1", temperature_c=16.0, ambient_c=8.0),
-        "r2": LocalRoomModel("r2", temperature_c=30.0, ambient_c=34.0),
+        "r1": LocalRoomModel("r1", temperature_c=24.2, ambient_c=33.0),
+        "r2": LocalRoomModel("r2", temperature_c=24.4, ambient_c=33.0),
+        "r3": LocalRoomModel("r3", temperature_c=24.3, ambient_c=33.0),
     }
+    return rooms, devices, storage, engine, sims
 
-    dt_s = 60.0
-    energy_kwh = {"r1": 0.0, "r2": 0.0}
-    for step in range(16):
-        t = step * dt_s
-        if step == 2:  # 120s 故障排除
-            equipment.set_available(True, t)
-        if step == 9:  # 540s 起主卧也要求制冷，进入 HEAT→OFF 等待→COOL
-            sims["r1"].temperature_c = 30.0
-            sims["r1"].ambient_c = 34.0
+
+def run(policy: StoragePolicy, label: str) -> None:
+    print(f"\n===== 策略：{label} =====")
+    rooms, devices, storage, engine, sims = build(policy)
+    restored = False
+    for step in range(STEPS):
+        t = step * DT_S
+        if step == 5:  # 300s：hp2 临时故障
+            devices[1].set_available(False, t)
+        if step == 8:  # 480s：故障恢复（最短停机从急停计，仍须等待）
+            devices[1].set_available(True, t)
+        if step == 6:  # 360s 起室外热浪，需求冲高
+            for sim in sims.values():
+                sim.ambient_c = 38.0
+        if step == 12 and not restored:  # 720s：保存并重开，状态连续
+            engine.save_state(STATE_FILE)
+            new_devices = [
+                HeatPump(HeatPumpSpec("hp1", 5.0, 5.0, 300.0, 180.0), now=-10_000.0),
+                HeatPump(HeatPumpSpec("hp2", 3.0, 3.0, 600.0, 300.0), now=-10_000.0),
+            ]
+            new_storage = ThermalStorage(storage.spec)
+            engine = BuildingEngine.restore(
+                STATE_FILE, rooms, new_devices, storage=new_storage
+            )
+            devices = new_devices
+            restored = True
+            print(f"  --- t={t:5.0f}s 状态已保存并重开（储量/等待/未满足账目连续） ---")
+
         for room_id, sim in sims.items():
             engine.ingest(Measurement(room_id, sim.temperature_c, t))
         result = engine.tick(t)
 
         for room_id, sim in sims.items():
-            # 只按设备“实际交付”的能量记账，计划量在等待/故障期间为 0。
             delivered = result.allocation_for(room_id)
-            heat = delivered.allocated_kw if delivered and delivered.mode is Mode.HEAT else 0.0
             cool = delivered.allocated_kw if delivered and delivered.mode is Mode.COOL else 0.0
-            energy_kwh[room_id] += (heat - cool) * dt_s / 3600.0
-            sim.step(dt_s, heat_input_kw=heat, cool_input_kw=cool)
+            heat = delivered.allocated_kw if delivered and delivered.mode is Mode.HEAT else 0.0
+            sim.step(DT_S, heat_input_kw=heat, cool_input_kw=cool)
 
-        plan_mode = result.plan.desired_mode.value
-        actual_mode = result.delivered_mode.value
-        flag = ""
-        if result.delivered_mode is not result.plan.desired_mode:
-            wait = f"，剩余等待 {result.lockout_remaining_s:.0f}s" if result.lockout_remaining_s else ""
-            flag = f"  计划={plan_mode} 但实际交付=off（{_reason_text(result)}{wait}）"
-        temps = ", ".join(
-            f"{rid}={sim.temperature_c:.2f}℃/净能量{energy_kwh[rid]:+.2f}kWh"
-            for rid, sim in sims.items()
+        dev_text = " ".join(
+            f"{info.device_id}={info.applied_mode.value}:{info.delivered_kw:.1f}kW"
+            + (f"(等{info.lockout_remaining_s:.0f}s)" if info.lockout_remaining_s > 0 else "")
+            + ("(故障)" if info.faulted else "")
+            for info in result.devices
         )
-        print(f"t={t:6.0f}s 设备={actual_mode:4s} {temps}{flag}")
+        sto = result.storage
+        sto_text = (
+            f"蓄{sto.charge_kw:.1f}/放{sto.discharge_kw:.1f}kW 冷仓{sto.cool_kwh:.2f}kWh"
+            if sto
+            else ""
+        )
+        cap = f"限电{result.power_cap_kw:.0f}kW" if result.power_cap_kw < 90 else ""
+        temps = " ".join(f"{rid}={sim.temperature_c:.1f}℃" for rid, sim in sims.items())
+        print(f"t={t:5.0f}s {dev_text} | {sto_text} {cap} | {temps}")
         for item in result.unmet:
             print(
-                f"         未满足: {item.room_id} 需{item.mode.value} "
-                f"{item.requested_kw:.1f}kW，缺 {item.unmet_kw:.1f}kW（{item.reason}）"
+                f"    未满足 {item.room_id}: 缺 {item.unmet_kw:.1f}kW（{item.reason}）"
             )
 
+    ledger = engine.energy_ledger()
+    print(f"  设备累计供能: {ledger['devices_kwh']}")
+    print(
+        f"  储能累计: 充 {ledger['storage_charge_kwh']:.2f} kWh，"
+        f"放 {ledger['storage_discharge_kwh']:.2f} kWh，期末冷仓 {storage.cool_kwh:.2f} kWh"
+    )
+    print(f"  未满足累计: {ledger['unmet_rooms_kwh']}")
 
-def _reason_text(result) -> str:
-    reasons = {item.reason for item in result.unmet}
-    if "equipment_faulted" in reasons:
-        return "设备临时故障"
-    if "min_off_not_satisfied" in reasons:
-        return "最短停机/切换等待未结束"
-    return "模式冲突或未运行"
+
+def main() -> None:
+    run(StoragePolicy.COMFORT_FIRST, "舒适优先（储能可放空）")
+    run(StoragePolicy.PRESERVE_RESERVE, "保留应急储备（50% 下限）")
 
 
 if __name__ == "__main__":
     main()
+
