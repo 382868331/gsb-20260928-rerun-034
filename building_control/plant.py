@@ -57,6 +57,20 @@ class DeviceView:
         return 0.0
 
 
+@dataclass(frozen=True)
+class DeviceDelivery:
+    """一台设备在一个周期内的真实供能账目。"""
+
+    device_id: str
+    mode: EquipmentMode
+    delivered_mode: EquipmentMode
+    output_kw: float
+    to_rooms_kw: float
+    to_storage_kw: float
+    lockout_remaining_s: float
+    faulted: bool
+
+
 class PowerSchedule:
     """按时段变化的站点总用电功率上限（kW）。
 
