@@ -109,6 +109,148 @@ def test_single_fault_leaves_other_device_serving():
     assert result.unmet_for("r3").unmet_kw == pytest.approx(3.0)
 
 
+def test_opposite_demands_keep_service_and_reason_for_every_partition():
+    rooms = [
+        RoomConfig("cold", "冷房", priority=1, setpoint_c=22.0, rated_input_kw=5.0),
+        RoomConfig("hot", "热房", priority=2, setpoint_c=22.0, rated_input_kw=5.0),
+    ]
+    device = make_device("hp1", heat=4.5, cool=3.5)
+    engine = BuildingEngine(rooms, device)
+    ingest_all(engine, {"cold": 15.0, "hot": 31.0}, 0.0)
+
+    result = engine.tick(0.0)
+
+    assert {a.room_id for a in result.plan.allocations} == {"cold", "hot"}
+    assert {a.room_id for a in result.delivered} == {"cold", "hot"}
+    cold = result.allocation_for("cold")
+    hot = result.allocation_for("hot")
+    assert cold.mode is Mode.HEAT
+    assert cold.allocated_kw == pytest.approx(4.5)
+    assert hot.mode is Mode.COOL
+    assert hot.allocated_kw == pytest.approx(0.0)
+    assert result.unmet_for("hot").mode is Mode.COOL
+    assert result.unmet_for("hot").reason == "mode_conflict"
+    assert result.unmet_for("hot").unmet_kw == pytest.approx(5.0)
+    assert sum(a.allocated_kw for a in result.delivered) == pytest.approx(4.5)
+
+    cooling_first = [
+        RoomConfig("hot", "热房", priority=1, setpoint_c=22.0, rated_input_kw=5.0),
+        RoomConfig("cold", "冷房", priority=2, setpoint_c=22.0, rated_input_kw=5.0),
+    ]
+    cooling_engine = BuildingEngine(
+        cooling_first,
+        make_device("hp1", heat=4.5, cool=3.5),
+    )
+    ingest_all(cooling_engine, {"cold": 15.0, "hot": 31.0}, 0.0)
+    cooling_result = cooling_engine.tick(0.0)
+    assert cooling_result.allocation_for("hot").allocated_kw == pytest.approx(3.5)
+    assert cooling_result.allocation_for("cold").allocated_kw == pytest.approx(0.0)
+    assert cooling_result.unmet_for("cold").reason == "mode_conflict"
+
+
+def test_direction_specific_capacity_fault_and_total_cap_are_separate():
+    rooms = [
+        RoomConfig("cool-a", "冷房A", priority=1, setpoint_c=22.0, rated_input_kw=4.0),
+        RoomConfig("cool-b", "冷房B", priority=2, setpoint_c=22.0, rated_input_kw=4.0),
+    ]
+
+    devices = [
+        make_device("hp1", heat=4.5, cool=3.5),
+        make_device("hp2", heat=4.5, cool=3.5),
+    ]
+    engine = BuildingEngine(rooms, devices)
+    ingest_all(engine, {"cool-a": 31.0, "cool-b": 31.0}, 0.0)
+    healthy = engine.tick(0.0)
+    assert sum(a.allocated_kw for a in healthy.delivered) == pytest.approx(7.0)
+    assert healthy.device_info("hp1").delivered_kw == pytest.approx(3.5)
+    assert healthy.device_info("hp2").delivered_kw == pytest.approx(3.5)
+    assert healthy.unmet_for("cool-b").reason == "capacity_exceeded"
+
+    devices[0].set_available(False, 60.0)
+    ingest_all(engine, {"cool-a": 31.0, "cool-b": 31.0}, 60.0)
+    faulted = engine.tick(60.0)
+    assert faulted.device_info("hp1").faulted is True
+    assert faulted.device_info("hp1").delivered_kw == pytest.approx(0.0)
+    assert faulted.device_info("hp2").delivered_kw == pytest.approx(3.5)
+    assert {a.room_id for a in faulted.delivered} == {"cool-a", "cool-b"}
+    assert faulted.allocation_for("cool-a").allocated_kw == pytest.approx(3.5)
+    assert faulted.allocation_for("cool-b").allocated_kw == pytest.approx(0.0)
+    assert faulted.unmet_for("cool-a").unmet_kw == pytest.approx(0.5)
+    assert faulted.unmet_for("cool-a").reason == "capacity_exceeded"
+    assert faulted.unmet_for("cool-b").unmet_kw == pytest.approx(4.0)
+    assert sum(a.allocated_kw for a in faulted.delivered) <= 3.5 + 1e-9
+    capped_engine = BuildingEngine(
+        rooms,
+        [
+            make_device("hp1", heat=4.5, cool=3.5),
+            make_device("hp2", heat=4.5, cool=3.5),
+        ],
+        power_schedule=PowerSchedule(segments=[(0.0, 4.0)]),
+    )
+    ingest_all(capped_engine, {"cool-a": 31.0, "cool-b": 31.0}, 120.0)
+    capped = capped_engine.tick(120.0)
+    assert sum(info.delivered_kw for info in capped.devices) == pytest.approx(4.0)
+    assert sum(a.allocated_kw for a in capped.delivered) == pytest.approx(4.0)
+    assert capped.unmet_for("cool-b").reason == "power_limited"
+
+    heating_devices = [
+        make_device("hp1", heat=4.5, cool=3.5),
+        make_device("hp2", heat=4.5, cool=3.5),
+    ]
+    heating_rooms = [
+        RoomConfig("heat-a", "冷房A", priority=1, setpoint_c=22.0, rated_input_kw=5.0),
+        RoomConfig("heat-b", "冷房B", priority=2, setpoint_c=22.0, rated_input_kw=5.0),
+    ]
+    heating_engine = BuildingEngine(heating_rooms, heating_devices)
+    ingest_all(heating_engine, {"heat-a": 15.0, "heat-b": 15.0}, 0.0)
+    heating = heating_engine.tick(0.0)
+    assert heating.device_info("hp1").delivered_kw == pytest.approx(4.5)
+    assert heating.device_info("hp2").delivered_kw == pytest.approx(4.5)
+    assert heating.allocation_for("heat-a").allocated_kw == pytest.approx(5.0)
+    assert heating.allocation_for("heat-b").allocated_kw == pytest.approx(4.0)
+    assert heating.unmet_for("heat-b").reason == "capacity_exceeded"
+
+
+def test_restore_preserves_faulted_capacity_and_conflict_basis(tmp_path):
+    rooms = [
+        RoomConfig("hot", "热房", priority=1, setpoint_c=22.0, rated_input_kw=5.0),
+        RoomConfig("cold", "冷房", priority=2, setpoint_c=22.0, rated_input_kw=5.0),
+    ]
+    devices = [
+        make_device("hp1", heat=4.5, cool=3.5),
+        make_device("hp2", heat=4.5, cool=3.5),
+    ]
+    devices[0].set_available(False, 0.0)
+    engine = BuildingEngine(rooms, devices)
+    ingest_all(engine, {"cold": 15.0, "hot": 31.0}, 0.0)
+    before = engine.tick(0.0)
+    engine.save_state(tmp_path / "state.json")
+
+    restored_devices = [
+        make_device("hp1", heat=4.5, cool=3.5),
+        make_device("hp2", heat=4.5, cool=3.5),
+    ]
+    restored = BuildingEngine.restore(tmp_path / "state.json", rooms, restored_devices)
+    ingest_all(restored, {"cold": 15.0, "hot": 31.0}, 60.0)
+    after = restored.tick(60.0)
+
+    expected = [
+        (a.room_id, a.mode, a.allocated_kw) for a in before.delivered
+    ]
+    actual = [
+        (a.room_id, a.mode, a.allocated_kw) for a in after.delivered
+    ]
+    assert actual == expected
+    assert after.allocation_for("hot").allocated_kw == pytest.approx(3.5)
+    assert after.allocation_for("cold").allocated_kw == pytest.approx(0.0)
+    assert after.unmet_for("hot").reason == "capacity_exceeded"
+    assert after.unmet_for("hot").unmet_kw == pytest.approx(1.5)
+    assert after.unmet_for("cold").reason == "mode_conflict"
+    assert after.device_info("hp1").faulted is True
+    assert after.device_info("hp2").delivered_kw == pytest.approx(3.5)
+    assert sum(a.allocated_kw for a in after.delivered) <= 3.5 + 1e-9
+
+
 def make_storage(heat_kwh=0.0, cool_kwh=0.0, capacity=10.0, eff=0.9):
     return ThermalStorage(
         StorageSpec(

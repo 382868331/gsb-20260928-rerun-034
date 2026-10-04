@@ -189,6 +189,12 @@ class BuildingEngine:
             total_capacity = sum(device.capacity_kw(desired) for device in self.devices)
             planned_allocations, capacity_unmet = Planner.allocate(room_states, winner, total_capacity)
             plan_unmet.extend(capacity_unmet)
+            suppressed_allocations = tuple(
+                Allocation(room.room_id, room.demand, room.requested_kw, 0.0)
+                for room in sorted(room_states, key=lambda r: r.config.priority)
+                if room.is_known_demand and room.demand is not winner
+            )
+            planned_allocations = suppressed_allocations + planned_allocations
         for room in sorted(room_states, key=lambda r: r.config.priority):
             if room.is_known_demand and room.demand is not winner:
                 plan_unmet.append(
@@ -222,11 +228,15 @@ class BuildingEngine:
         power_cap = self.power_schedule.cap_kw(current) if self.power_schedule else float("inf")
 
         # 实际交付：设备当刻产出先供房间，富余能力给储能充电，缺口由储能放电补足。
+        demanding_rooms = sorted(
+            (room for room in room_states if room.is_known_demand),
+            key=lambda room: room.config.priority,
+        )
         requests = sorted(
             (room for room in room_states if room.demand is winner and room.is_known_demand),
             key=lambda room: room.config.priority,
         )
-        room_device_kw = {room.room_id: 0.0 for room in requests}
+        room_device_kw = {room.room_id: 0.0 for room in demanding_rooms}
         device_output = {device.device_id: 0.0 for device in self.devices}
         charge_kw = 0.0
         discharge_kw = 0.0
@@ -255,7 +265,7 @@ class BuildingEngine:
                 used += accepted
             device_output[device.device_id] = used
 
-        room_storage_kw = {room.room_id: 0.0 for room in requests}
+        room_storage_kw = {room.room_id: 0.0 for room in demanding_rooms}
         reserve_floor = self._reserve_floor_kwh(winner) if desired.running else 0.0
         if self.storage is not None and desired.running:
             for room in requests:
@@ -266,18 +276,19 @@ class BuildingEngine:
                 room_storage_kw[room.room_id] += got
                 discharge_kw += got
 
-        if active_devices:
-            delivered = tuple(
-                Allocation(
-                    room_id=room.room_id,
-                    mode=winner,
-                    requested_kw=room.requested_kw,
-                    allocated_kw=room_device_kw[room.room_id] + room_storage_kw[room.room_id],
-                )
-                for room in requests
+        delivered = tuple(
+            Allocation(
+                room_id=room.room_id,
+                mode=room.demand,
+                requested_kw=room.requested_kw,
+                allocated_kw=(
+                    room_device_kw[room.room_id] + room_storage_kw[room.room_id]
+                    if room.demand is winner
+                    else 0.0
+                ),
             )
-        else:
-            delivered = ()
+            for room in demanding_rooms
+        )
         delivered_map = {a.room_id: a.allocated_kw for a in delivered}
 
         unmet = self._unmet(

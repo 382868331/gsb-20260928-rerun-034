@@ -47,9 +47,11 @@ def test_conflicting_heat_cool_priority_decides_mode():
     assert result.plan.desired_mode is EquipmentMode.HEAT
     assert result.applied_mode is EquipmentMode.HEAT
     assert result.allocation_for("r1").allocated_kw > 0
-    assert result.allocation_for("r2") is None
+    assert result.allocation_for("r2").mode is Mode.COOL
+    assert result.allocation_for("r2").allocated_kw == pytest.approx(0.0)
     r2_state = next(room for room in result.rooms if room.room_id == "r2")
     assert r2_state.demand is Mode.COOL
+    assert result.unmet_for("r2").reason == "mode_conflict"
     assert "模式冲突" in result.plan.notes[0]
 
 
@@ -64,7 +66,9 @@ def test_lower_priority_room_can_win_when_it_ranks_first():
 
     result = engine.tick(0.0)
     assert result.plan.desired_mode is EquipmentMode.COOL
-    assert result.allocation_for("r1") is None
+    assert result.allocation_for("r1").mode is Mode.HEAT
+    assert result.allocation_for("r1").allocated_kw == pytest.approx(0.0)
+    assert result.unmet_for("r1").reason == "mode_conflict"
     assert result.allocation_for("r2").allocated_kw > 0
 
 
@@ -110,7 +114,7 @@ def test_min_on_time_blocks_early_shutdown_and_mode_flip():
     assert result.plan.desired_mode is EquipmentMode.COOL
     assert result.applied_mode is EquipmentMode.OFF
     assert result.delivered_mode is EquipmentMode.OFF
-    assert result.allocation_for("r1") is None
+    assert result.allocation_for("r1").allocated_kw == pytest.approx(0.0)
     unmet = result.unmet_for("r1")
     assert unmet.reason == "min_off_not_satisfied"
     assert unmet.unmet_kw > 0
@@ -190,7 +194,7 @@ def test_planned_capacity_is_not_delivered_during_min_off_wait():
     assert result.plan.desired_mode is EquipmentMode.HEAT
     assert result.plan.allocated_for("r1").allocated_kw > 0
     assert result.delivered_mode is EquipmentMode.OFF
-    assert result.delivered == ()
+    assert result.delivered[0].allocated_kw == pytest.approx(0.0)
     unmet = result.unmet_for("r1")
     assert unmet.reason == "min_off_not_satisfied"
     assert unmet.unmet_kw == pytest.approx(unmet.requested_kw)
@@ -294,9 +298,9 @@ def test_energy_accounting_uses_only_delivered_power():
     # 设备处于最短停机等待：计划制热但实际交付 0。
     engine.ingest(Measurement("r1", 16.0, 0.0))
     result = engine.tick(0.0)
-    assert result.delivered == ()
+    assert result.delivered[0].allocated_kw == pytest.approx(0.0)
     delivered = result.allocation_for("r1")
-    heat = delivered.allocated_kw if delivered else 0.0
+    heat = delivered.allocated_kw
     sim.step(60.0, heat_input_kw=heat)
     assert sim.temperature_c == pytest.approx(before)
 

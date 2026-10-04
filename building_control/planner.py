@@ -105,11 +105,20 @@ class Planner:
     def plan(self, rooms: list[RoomState]) -> ControlPlan:
         winner, notes = self.arbitrate(rooms)
         unmet: list[UnmetDemand] = []
+        suppressed_allocations: list[Allocation] = []
         for room in sorted(rooms, key=lambda r: r.config.priority):
             if not room.is_known_demand:
                 continue
             if room.demand is winner:
                 continue
+            suppressed_allocations.append(
+                Allocation(
+                    room_id=room.room_id,
+                    mode=room.demand,
+                    requested_kw=room.requested_kw,
+                    allocated_kw=0.0,
+                )
+            )
             unmet.append(
                 UnmetDemand(
                     room_id=room.room_id,
@@ -124,4 +133,9 @@ class Planner:
         equipment_mode = EquipmentMode(winner.value)
         capacity = self.equipment.capacity_kw(equipment_mode)
         allocations, capacity_unmet = self.allocate(rooms, winner, capacity)
-        return ControlPlan(equipment_mode, allocations, notes, tuple(unmet) + capacity_unmet)
+        return ControlPlan(
+            equipment_mode,
+            tuple(suppressed_allocations) + allocations,
+            notes,
+            tuple(unmet) + capacity_unmet,
+        )
