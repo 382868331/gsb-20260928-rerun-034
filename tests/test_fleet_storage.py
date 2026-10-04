@@ -427,3 +427,135 @@ def test_save_restore_keeps_storage_waits_and_unmet_continuity(tmp_path):
     assert recovered.device_info("hp2").delivered_kw > 0
     ledger_after = restored.energy_ledger()
     assert ledger_after["unmet_rooms_kwh"]["r2"] > ledger_before["unmet_rooms_kwh"]["r2"]
+
+def _opposite_rooms(heat_priority=1, cool_priority=2):
+    return [
+        RoomConfig("cold", "冷房", priority=heat_priority, setpoint_c=22.0, rated_input_kw=5.0),
+        RoomConfig("hot", "热房", priority=cool_priority, setpoint_c=22.0, rated_input_kw=5.0),
+    ]
+
+
+def test_direction_capable_devices_serve_their_own_rooms_simultaneously():
+    """只制冷机服务热房间、只制热机服务冷房，同一周期双向并行。"""
+    rooms = _opposite_rooms()
+    devices = [
+        make_device("cooler", heat=0.0, cool=4.5),
+        make_device("heater", heat=3.5, cool=0.0),
+    ]
+    engine = BuildingEngine(rooms, devices)
+    ingest_all(engine, {"cold": 15.0, "hot": 31.0}, 0.0)
+
+    result = engine.tick(0.0)
+
+    assert result.device_info("cooler").applied_mode is EquipmentMode.COOL
+    assert result.device_info("heater").applied_mode is EquipmentMode.HEAT
+    assert result.device_info("cooler").delivered_kw == pytest.approx(4.5)
+    assert result.device_info("heater").delivered_kw == pytest.approx(3.5)
+    assert result.allocation_for("hot").mode is Mode.COOL
+    assert result.allocation_for("hot").allocated_kw == pytest.approx(4.5)
+    assert result.allocation_for("cold").mode is Mode.HEAT
+    assert result.allocation_for("cold").allocated_kw == pytest.approx(3.5)
+    assert result.unmet_for("hot").reason == "capacity_exceeded"
+    assert result.unmet_for("hot").unmet_kw == pytest.approx(0.5)
+    assert result.unmet_for("cold").reason == "capacity_exceeded"
+    assert result.unmet_for("cold").unmet_kw == pytest.approx(1.5)
+    assert sum(a.allocated_kw for a in result.delivered) == pytest.approx(8.0)
+
+
+def test_direction_assignment_is_stable_when_registration_order_swapped():
+    rooms = _opposite_rooms()
+    devices = [
+        make_device("heater", heat=3.5, cool=0.0),
+        make_device("cooler", heat=0.0, cool=4.5),
+    ]
+    engine = BuildingEngine(rooms, devices)
+    ingest_all(engine, {"cold": 15.0, "hot": 31.0}, 0.0)
+
+    result = engine.tick(0.0)
+
+    delivered = {a.room_id: a.allocated_kw for a in result.delivered}
+    assert delivered["hot"] == pytest.approx(4.5)
+    assert delivered["cold"] == pytest.approx(3.5)
+    assert result.device_info("cooler").applied_mode is EquipmentMode.COOL
+    assert result.device_info("heater").applied_mode is EquipmentMode.HEAT
+
+
+def test_shared_site_cap_spans_both_directions_by_room_priority():
+    rooms = _opposite_rooms(heat_priority=2, cool_priority=1)
+    devices = [
+        make_device("cooler", heat=0.0, cool=4.5),
+        make_device("heater", heat=3.5, cool=0.0),
+    ]
+    schedule = PowerSchedule(segments=[(0.0, 5.0)])
+    engine = BuildingEngine(rooms, devices, power_schedule=schedule)
+    ingest_all(engine, {"cold": 15.0, "hot": 31.0}, 0.0)
+
+    result = engine.tick(0.0)
+
+    # 热房间（制冷需求，优先级1）先拿满 5kW 中的 4.5，冷房只分得 0.5kW。
+    assert sum(info.delivered_kw for info in result.devices) == pytest.approx(5.0)
+    assert result.allocation_for("hot").allocated_kw == pytest.approx(4.5)
+    assert result.allocation_for("cold").allocated_kw == pytest.approx(0.5)
+    assert result.unmet_for("cold").reason == "power_limited"
+    assert result.unmet_for("cold").unmet_kw == pytest.approx(4.5)
+    assert sum(a.allocated_kw for a in result.delivered) <= 5.0 + 1e-9
+
+
+def test_missing_direction_capability_reports_mode_unsupported():
+    rooms = _opposite_rooms()
+    engine = BuildingEngine(rooms, [make_device("cooler", heat=0.0, cool=4.5)])
+    ingest_all(engine, {"cold": 15.0, "hot": 31.0}, 0.0)
+
+    result = engine.tick(0.0)
+
+    assert result.device_info("cooler").applied_mode is EquipmentMode.COOL
+    assert result.allocation_for("hot").allocated_kw == pytest.approx(4.5)
+    assert result.allocation_for("cold").allocated_kw == pytest.approx(0.0)
+    assert result.unmet_for("cold").reason == "mode_unsupported"
+    assert result.unmet_for("cold").unmet_kw == pytest.approx(5.0)
+
+
+def test_heater_fault_leaves_cooler_serving_and_other_demand_faulted():
+    rooms = _opposite_rooms()
+    cooler = make_device("cooler", heat=0.0, cool=4.5)
+    heater = make_device("heater", heat=3.5, cool=0.0)
+    engine = BuildingEngine(rooms, [cooler, heater])
+    ingest_all(engine, {"cold": 15.0, "hot": 31.0}, 0.0)
+    heater.set_available(False, 0.0)
+
+    result = engine.tick(0.0)
+
+    assert result.device_info("cooler").delivered_kw == pytest.approx(4.5)
+    assert result.device_info("heater").delivered_kw == pytest.approx(0.0)
+    assert result.allocation_for("hot").allocated_kw == pytest.approx(4.5)
+    assert result.allocation_for("cold").allocated_kw == pytest.approx(0.0)
+    assert result.unmet_for("cold").reason == "equipment_faulted"
+
+
+def test_per_direction_allocation_is_identical_after_restore(tmp_path):
+    rooms = _opposite_rooms()
+    devices = [
+        make_device("cooler", heat=0.0, cool=4.5),
+        make_device("heater", heat=3.5, cool=0.0),
+    ]
+    schedule = PowerSchedule(segments=[(0.0, 6.0)])
+    engine = BuildingEngine(rooms, devices, power_schedule=schedule)
+    ingest_all(engine, {"cold": 15.0, "hot": 31.0}, 0.0)
+    before = engine.tick(0.0)
+    engine.save_state(tmp_path / "state.json")
+
+    def build_new():
+        return [
+            make_device("cooler", heat=0.0, cool=4.5),
+            make_device("heater", heat=3.5, cool=0.0),
+        ]
+
+    restored = BuildingEngine.restore(tmp_path / "state.json", rooms, build_new())
+    ingest_all(restored, {"cold": 15.0, "hot": 31.0}, 60.0)
+    after = restored.tick(60.0)
+
+    expected = [(a.room_id, a.mode, a.allocated_kw) for a in before.delivered]
+    actual = [(a.room_id, a.mode, a.allocated_kw) for a in after.delivered]
+    assert actual == expected
+    assert restored.power_schedule.cap_kw(60.0) == pytest.approx(6.0)
+    assert sum(a.allocated_kw for a in after.delivered) <= 6.0 + 1e-9
