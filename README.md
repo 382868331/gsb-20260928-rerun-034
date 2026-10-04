@@ -21,20 +21,26 @@
 
 - **多设备协同**：`BuildingEngine` 接受设备列表，每台设备保留自己的最短开/停等待、
   故障标志与供能账目（`TickResult.devices` / `energy_ledger()`）。
-  需求按优先级先由第一台设备的当刻产出满足，不足部分依次由后续设备补足；
+  每个方向的需求按优先级先由该方向第一台设备的当刻产出满足，不足部分依次由后续设备补足；
   正常、限电与单台故障场景都按真实剩余能力分配，而不是只描述设备却按一台供给。
-- **冲突仲裁**：有冷热需求时，机群只能运行一种模式；`priority` 数值最小的房间决定模式，
-  相反需求房间本周期不供给，仲裁原因写入 `ControlPlan.notes`。
+- **混合模式机群**：冷热需求同时出现时，不再只返回一种全局模式——每台设备独立分配目标方向
+  （`DeviceTickInfo.target_mode`），机群可同时一台制热、一台制冷（如 15℃ 与 31℃、
+  目标 22℃ 时 4.5kW 与 3.5kW 各管一个方向）。分配规则确定：已在需求方向运行的设备保持原向，
+  其余设备贪心补向缺口最大的方向，并列时优先级数值小者先、再制热优先；故障设备不参与分配。
+- **冲突仲裁**：只有没有任何设备可覆盖的方向才算冲突（如单设备面对冷热两个分区）；
+  该方向每个分区都保留 `mode_conflict` 未满足记录，仲裁原因写入 `ControlPlan.notes`，
+  绝不删除分区来让总量看起来正确。
 - **冷热缓冲储能**：`ThermalStorage` 分热仓/冷仓。设备供完房间后的富余出力给储能充电
   （低需求蓄能）；设备能力不足或限电时储能放电补足（高需求放能）。
   `TickResult.storage` 明确区分设备当刻产出、储能充/放功率与期末两仓储量；
+  混合模式下冷热两方向可同时充/放各自的仓（`heat_charge_kw`/`cool_discharge_kw` 等分项），
   充电按充电效率入库、放电按放电效率出库，损耗凭空消失、不被补足。
 - **两种储能策略**：`StoragePolicy.COMFORT_FIRST`（舒适优先，储能可放空）与
   `StoragePolicy.PRESERVE_RESERVE`（保留应急储备，放到 `reserve_fraction` 下限为止，
   被保留的缺口记为 `storage_reserve_held`）。同一剧本可对比两种安排的账目。
 - **不同性质储量不相抵**：热仓与冷仓物理分开，设备从制热切换到制冷时，
   热仓储量原样保留，绝不当冷量使用，反之亦然。
-- **站点限电**：`PowerSchedule` 按时段给出总功率上限，设备总出力（含给储能充电）
+- **站点限电**：`PowerSchedule` 按时段给出总功率上限，机群各方向设备总出力（含给储能充电）
   不得超限；因限电产生的缺口记为 `power_limited`。
 - **计划量 ≠ 实际输出**：`ControlPlan.allocations` 只是“想供多少”；
   `TickResult.delivered` 才是设备按**当前真实运行模式**交付的能量，房间热模型只能消费它。
@@ -44,8 +50,10 @@
 - **临时故障与重新分配**：`HeatPump.set_available(False, t)` 急停回 `OFF`，
   其余设备继续按真实能力供给；故障恢复后仍须满足最短停机（从急停时刻计）。
 - **未满足需求账目**：`TickResult.unmet` 逐条记录 `room_id / mode / requested_kw / unmet_kw / reason`，
-  原因包括 `mode_conflict`、`min_off_not_satisfied`、`capacity_exceeded`、
-  `equipment_faulted`、`power_limited`、`storage_reserve_held`；
+  每个有需求的分区要么出现在 `delivered`、要么出现在 `unmet`，两者必居其一；
+  原因包括 `mode_conflict`（机群无任何设备覆盖该方向）、`min_off_not_satisfied`、
+  `capacity_exceeded`、`equipment_faulted`（含“若无故障假设分配会覆盖该方向”的情形）、
+  `power_limited`、`storage_reserve_held`；
   `energy_ledger()` 把各设备供能、储能充放与各房间未满足能量按 tick 间隔累计成 kWh。
 - **传感器断流保守状态**：读数超过 `sensor_stale_after_s` 未更新即 `STALE`，从未上报为 `NEVER`；
   两种状态下温度显式为 `None`、需求为 `Mode.UNKNOWN`，绝不复用旧读数。
