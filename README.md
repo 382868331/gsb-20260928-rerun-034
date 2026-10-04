@@ -21,11 +21,16 @@
 
 - **多设备协同**：`BuildingEngine` 接受设备列表，每台设备保留自己的最短开/停等待、
   故障标志与供能账目（`TickResult.devices` / `energy_ledger()`）。
-  需求按优先级先由第一台设备的当刻产出满足，不足部分依次由后续设备补足；
+  每台设备按自己的方向能力独立选择运行模式：仅能制冷/仅能制热的设备分别服务
+  对应方向的房间（例如一台仅制冷 4.5kW、一台仅制热 3.5kW 时，热房间与冷房间
+  同时被真实供给）；冷热双向设备在两侧都有需求时跟随全局仲裁胜者。
+  需求在同一方向内按优先级先由第一台设备的当刻产出满足，不足部分依次由后续设备补足；
   正常、限电与单台故障场景都按真实剩余能力分配，而不是只描述设备却按一台供给。
-- **冲突仲裁**：有冷热需求时，机群只能运行一种模式；`priority` 数值最小的房间决定模式，
+- **冲突仲裁**：冷热双向设备被迫二选一时，`priority` 数值最小的房间决定其模式，
   相反需求房间仍保留一条 `0.0 kW` 服务记录，并以 `mode_conflict` 写入未满足原因，
-  仲裁依据同时写入 `ControlPlan.notes`。
+  仲裁依据同时写入 `ControlPlan.notes`；某方向完全没有任何设备具备能力时记为
+  `no_capability`，与设备受启停保护（`min_off_not_satisfied`）、预算不足
+  （`power_limited`）明确区分。
 - **冷热缓冲储能**：`ThermalStorage` 分热仓/冷仓。设备供完房间后的富余出力给储能充电
   （低需求蓄能）；设备能力不足或限电时储能放电补足（高需求放能）。
   `TickResult.storage` 明确区分设备当刻产出、储能充/放功率与期末两仓储量；
@@ -45,7 +50,7 @@
 - **临时故障与重新分配**：`HeatPump.set_available(False, t)` 急停回 `OFF`，
   其余设备继续按真实能力供给；故障恢复后仍须满足最短停机（从急停时刻计）。
 - **未满足需求账目**：`TickResult.unmet` 逐条记录 `room_id / mode / requested_kw / unmet_kw / reason`，
-  原因包括 `mode_conflict`、`min_off_not_satisfied`、`capacity_exceeded`、
+  原因包括 `mode_conflict`、`no_capability`、`min_off_not_satisfied`、`capacity_exceeded`、
   `equipment_faulted`、`power_limited`、`storage_reserve_held`；
   `energy_ledger()` 把各设备供能、储能充放与各房间未满足能量按 tick 间隔累计成 kWh。
 - **传感器断流保守状态**：读数超过 `sensor_stale_after_s` 未更新即 `STALE`，从未上报为 `NEVER`；

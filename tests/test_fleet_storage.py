@@ -267,6 +267,144 @@ def make_storage(heat_kwh=0.0, cool_kwh=0.0, capacity=10.0, eff=0.9):
     )
 
 
+def direction_rooms():
+    return [
+        RoomConfig("cold", "冷房", priority=1, setpoint_c=22.0, rated_input_kw=5.0),
+        RoomConfig("hot", "热房", priority=2, setpoint_c=22.0, rated_input_kw=5.0),
+    ]
+
+
+def test_direction_specific_devices_serve_both_rooms_independently():
+    """仅能制冷 4.5kW 与仅能制热 3.5kW 的两台设备分别服务对应房间。"""
+    rooms = direction_rooms()
+    cooler = make_device("cooler", heat=0.0, cool=4.5)
+    heater = make_device("heater", heat=3.5, cool=0.0)
+    engine = BuildingEngine(rooms, [cooler, heater])
+    ingest_all(engine, {"cold": 15.0, "hot": 31.0}, 0.0)
+
+    result = engine.tick(0.0)
+
+    assert result.device_info("cooler").applied_mode is EquipmentMode.COOL
+    assert result.device_info("heater").applied_mode is EquipmentMode.HEAT
+    assert result.device_info("cooler").delivered_kw == pytest.approx(4.5)
+    assert result.device_info("heater").delivered_kw == pytest.approx(3.5)
+    cold = result.allocation_for("cold")
+    hot = result.allocation_for("hot")
+    assert cold.mode is Mode.HEAT
+    assert cold.allocated_kw == pytest.approx(3.5)
+    assert hot.mode is Mode.COOL
+    assert hot.allocated_kw == pytest.approx(4.5)
+    # 两个房间都被真实服务，不再只有模式冲突解释。
+    assert result.unmet_for("cold").unmet_kw == pytest.approx(1.5)
+    assert result.unmet_for("cold").reason == "capacity_exceeded"
+    assert result.unmet_for("hot").unmet_kw == pytest.approx(0.5)
+    assert result.unmet_for("hot").reason == "capacity_exceeded"
+    assert all(item.reason != "mode_conflict" for item in result.unmet)
+    # 不得超过真实能力：制冷机不出热量，制热机不出冷量。
+    assert sum(a.allocated_kw for a in result.delivered) == pytest.approx(8.0)
+
+
+def test_direction_allocation_is_order_independent_and_respects_site_cap():
+    rooms = direction_rooms()
+
+    def build(order, cap=None):
+        devices = {
+            "cooler": make_device("cooler", heat=0.0, cool=4.5),
+            "heater": make_device("heater", heat=3.5, cool=0.0),
+        }
+        schedule = PowerSchedule(segments=[(0.0, cap)]) if cap is not None else None
+        return BuildingEngine(rooms, [devices[key] for key in order], power_schedule=schedule)
+
+    delivered_by_order = {}
+    for order in (("cooler", "heater"), ("heater", "cooler")):
+        engine = build(order)
+        ingest_all(engine, {"cold": 15.0, "hot": 31.0}, 0.0)
+        result = engine.tick(0.0)
+        delivered_by_order[order] = {
+            a.room_id: a.allocated_kw for a in result.delivered
+        }
+    assert delivered_by_order[("cooler", "heater")] == delivered_by_order[("heater", "cooler")]
+
+    # 站点限额 5kW：总交付不得超限，缺口记为 power_limited。
+    capped = build(("cooler", "heater"), cap=5.0)
+    ingest_all(capped, {"cold": 15.0, "hot": 31.0}, 0.0)
+    result = capped.tick(0.0)
+    assert sum(a.allocated_kw for a in result.delivered) <= 5.0 + 1e-9
+    assert sum(info.delivered_kw for info in result.devices) <= 5.0 + 1e-9
+    assert any(item.reason == "power_limited" for item in result.unmet)
+
+
+def test_direction_fault_lockout_and_budget_reasons_are_distinct():
+    """故障、启停保护与预算不足在同一场景下分别记账。"""
+    rooms = [
+        RoomConfig("cool-a", "冷房A", priority=1, setpoint_c=22.0, rated_input_kw=4.0),
+        RoomConfig("cool-b", "冷房B", priority=2, setpoint_c=22.0, rated_input_kw=4.0),
+        RoomConfig("heat-a", "热房", priority=3, setpoint_c=22.0, rated_input_kw=4.0),
+    ]
+    cooler = make_device("cooler", heat=0.0, cool=4.0)
+    heater = make_device("heater", heat=4.0, cool=0.0, min_off=300.0)
+    schedule = PowerSchedule(segments=[(0.0, 6.0)])
+    engine = BuildingEngine(rooms, [cooler, heater], power_schedule=schedule)
+    # heater 处于最短停机等待中。
+    heater.mode = EquipmentMode.OFF
+    heater.state_since = -100.0
+    cooler.set_available(False, -50.0)
+    ingest_all(engine, {"cool-a": 31.0, "cool-b": 31.0, "heat-a": 15.0}, 0.0)
+
+    result = engine.tick(0.0)
+
+    assert result.device_info("cooler").faulted is True
+    assert result.device_info("heater").applied_mode is EquipmentMode.OFF
+    assert result.unmet_for("cool-a").reason == "equipment_faulted"
+    assert result.unmet_for("cool-b").reason == "equipment_faulted"
+    assert result.unmet_for("heat-a").reason == "min_off_not_satisfied"
+    assert sum(a.allocated_kw for a in result.delivered) == pytest.approx(0.0)
+
+    # 故障恢复、停机等待结束：限电 6kW 下制冷 4kW + 制热 2kW，热房缺口记预算不足。
+    cooler.set_available(True, 60.0)
+    ingest_all(engine, {"cool-a": 31.0, "cool-b": 31.0, "heat-a": 15.0}, 400.0)
+    recovered = engine.tick(400.0)
+    assert recovered.device_info("cooler").delivered_kw == pytest.approx(4.0)
+    assert recovered.device_info("heater").delivered_kw == pytest.approx(2.0)
+    assert recovered.allocation_for("heat-a").allocated_kw == pytest.approx(2.0)
+    assert recovered.unmet_for("heat-a").reason == "power_limited"
+    assert sum(a.allocated_kw for a in recovered.delivered) <= 6.0 + 1e-9
+
+
+def test_direction_allocation_consistent_across_save_restore(tmp_path):
+    rooms = direction_rooms()
+
+    def build():
+        return [
+            make_device("cooler", heat=0.0, cool=4.5),
+            make_device("heater", heat=3.5, cool=0.0),
+        ]
+
+    devices = build()
+    engine = BuildingEngine(rooms, devices)
+    ingest_all(engine, {"cold": 15.0, "hot": 31.0}, 0.0)
+    engine.tick(0.0)
+    state_file = tmp_path / "state.json"
+    engine.save_state(state_file)
+
+    restored_devices = build()
+    restored = BuildingEngine.restore(state_file, rooms, restored_devices)
+    ingest_all(restored, {"cold": 15.0, "hot": 31.0}, 60.0)
+    after = restored.tick(60.0)
+
+    continuous = BuildingEngine(rooms, build())
+    ingest_all(continuous, {"cold": 15.0, "hot": 31.0}, 0.0)
+    continuous.tick(0.0)
+    ingest_all(continuous, {"cold": 15.0, "hot": 31.0}, 60.0)
+    expected = continuous.tick(60.0)
+
+    actual_map = {a.room_id: (a.mode, a.allocated_kw) for a in after.delivered}
+    expected_map = {a.room_id: (a.mode, a.allocated_kw) for a in expected.delivered}
+    assert actual_map == expected_map
+    assert after.device_info("cooler").applied_mode is EquipmentMode.COOL
+    assert after.device_info("heater").applied_mode is EquipmentMode.HEAT
+
+
 def test_storage_charges_at_low_demand_and_discharges_at_high():
     rooms = [
         RoomConfig("r1", "主卧", priority=1, setpoint_c=22.0, rated_input_kw=3.0),
