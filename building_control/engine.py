@@ -246,13 +246,33 @@ class BuildingEngine:
             desired, tuple(suppressed_allocations) + tuple(served_allocations), notes, tuple(plan_unmet)
         )
 
+        power_cap = self.power_schedule.cap_kw(current) if self.power_schedule else float("inf")
+
         # 逐台设备执行模式切换：各自保留最短开/停等待，冷热不能直接互切。
+        # 站点预算不足以让设备出力时，不让设备进入虚假的运行方向：目标被压回
+        # OFF，并把真实阻止条件（故障/启停保护/预算不足）记入 device_block。
         device_infos: list[DeviceTickInfo] = []
+        device_block: dict[str, str] = {}
+        remaining_power = power_cap
         for device in self.devices:
             previous = device.mode
             target = assigned[device.device_id]
             if previous.running and previous is not target:
                 target = EquipmentMode.OFF
+            if target.running:
+                if not device.available:
+                    device_block[device.device_id] = "equipment_faulted"
+                    target = EquipmentMode.OFF
+                elif not device.allow(target, current):
+                    device_block[device.device_id] = "min_off_not_satisfied"
+                    target = EquipmentMode.OFF
+                else:
+                    budget = max(0.0, min(device.capacity_kw(target), remaining_power))
+                    if budget <= 1e-9:
+                        device_block[device.device_id] = "power_limited"
+                        target = EquipmentMode.OFF
+                    else:
+                        remaining_power -= budget
             if device.allow(target, current):
                 device.apply(target, current)
             device_infos.append(
@@ -265,8 +285,6 @@ class BuildingEngine:
                     delivered_kw=0.0,
                 )
             )
-
-        power_cap = self.power_schedule.cap_kw(current) if self.power_schedule else float("inf")
 
         # 实际交付：设备当刻产出先供房间，富余能力给储能充电，缺口由储能放电补足。
         # 每台设备只服务自己当前运行方向的房间，站点限电按登记顺序依次约束。
@@ -335,7 +353,7 @@ class BuildingEngine:
 
         unmet = self._unmet(
             room_states, assigned, delivered_map, active_devices,
-            device_output, power_cap, reserve_floors,
+            device_output, power_cap, reserve_floors, device_block,
         )
 
         running_modes = [
@@ -418,6 +436,7 @@ class BuildingEngine:
         device_output: dict[str, float],
         power_cap_kw: float,
         reserve_floors: dict[Mode, float],
+        device_block: dict[str, str],
     ) -> tuple[UnmetDemand, ...]:
         unmet: list[UnmetDemand] = []
         total_active_capacity = sum(
@@ -458,13 +477,30 @@ class BuildingEngine:
                 # 没有任何设备具备该方向能力。
                 reason = "no_capability"
             elif not serving:
-                # 有设备具备该方向能力，但本周期被仲裁到相反方向。
-                reason = "mode_conflict"
+                if power_cap_kw <= 1e-9:
+                    # 零预算：任何设备都无法出力，预算是真实阻止条件。
+                    reason = "power_limited"
+                else:
+                    # 有设备具备该方向能力，但本周期被仲裁到相反方向。
+                    reason = "mode_conflict"
             elif not active:
                 if all(device.faulted for device in serving):
                     reason = "equipment_faulted"
-                else:
+                elif any(
+                    device_block.get(device.device_id) == "min_off_not_satisfied"
+                    for device in serving
+                ):
                     # 受最短开/停保护，本周期不能切换到位。
+                    reason = "min_off_not_satisfied"
+                elif any(
+                    device_block.get(device.device_id) == "power_limited"
+                    for device in serving
+                ):
+                    # 站点预算不足，设备本周期无法出力。
+                    reason = "power_limited"
+                elif any(device.faulted for device in serving):
+                    reason = "equipment_faulted"
+                else:
                     reason = "min_off_not_satisfied"
             elif power_limited:
                 reason = "power_limited"

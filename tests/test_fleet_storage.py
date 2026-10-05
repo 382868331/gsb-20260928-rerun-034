@@ -565,3 +565,149 @@ def test_save_restore_keeps_storage_waits_and_unmet_continuity(tmp_path):
     assert recovered.device_info("hp2").delivered_kw > 0
     ledger_after = restored.energy_ledger()
     assert ledger_after["unmet_rooms_kwh"]["r2"] > ledger_before["unmet_rooms_kwh"]["r2"]
+
+
+def test_zero_budget_keeps_bidirectional_devices_off_and_reports_real_blockers():
+    """零预算时双向设备不显示虚假方向，欠供按真实阻止条件解释。"""
+    rooms = direction_rooms()
+    schedule = PowerSchedule(
+        segments=[(0.0, 0.0), (60.0, 4.0), (120.0, 100.0)]
+    )
+    devices = [
+        make_device("hp1", heat=4.5, cool=3.5),
+        make_device("hp2", heat=4.5, cool=3.5),
+    ]
+    engine = BuildingEngine(rooms, devices, power_schedule=schedule)
+    ingest_all(engine, {"cold": 15.0, "hot": 31.0}, 0.0)
+
+    zero = engine.tick(0.0)
+
+    # 零预算：两台双向设备都保持 OFF，不显示虚假的制热方向。
+    assert zero.device_info("hp1").applied_mode is EquipmentMode.OFF
+    assert zero.device_info("hp2").applied_mode is EquipmentMode.OFF
+    assert sum(info.delivered_kw for info in zero.devices) == pytest.approx(0.0)
+    assert sum(a.allocated_kw for a in zero.delivered) == pytest.approx(0.0)
+    # 两个方向的欠供都解释为预算不足，而不是模式冲突。
+    assert zero.unmet_for("cold").reason == "power_limited"
+    assert zero.unmet_for("hot").reason == "power_limited"
+    assert all(item.reason != "mode_conflict" for item in zero.unmet)
+
+    # 恢复部分预算 4kW：hp1 真实制热 4kW，hp2 无预算保持 OFF。
+    ingest_all(engine, {"cold": 15.0, "hot": 31.0}, 60.0)
+    partial = engine.tick(60.0)
+    assert partial.device_info("hp1").applied_mode is EquipmentMode.HEAT
+    assert partial.device_info("hp1").delivered_kw == pytest.approx(4.0)
+    assert partial.device_info("hp2").applied_mode is EquipmentMode.OFF
+    assert partial.device_info("hp2").delivered_kw == pytest.approx(0.0)
+    assert partial.allocation_for("cold").allocated_kw == pytest.approx(4.0)
+    assert partial.unmet_for("cold").reason == "power_limited"
+    assert partial.unmet_for("cold").unmet_kw == pytest.approx(1.0)
+    # 热房方向有能力设备但被仲裁到制热：记模式冲突而非预算。
+    assert partial.unmet_for("hot").reason == "mode_conflict"
+
+    # 预算恢复且 hp1 故障：hp2 真实制热，冷房缺口记能力不足。
+    devices[0].set_available(False, 120.0)
+    ingest_all(engine, {"cold": 15.0, "hot": 31.0}, 120.0)
+    faulted = engine.tick(120.0)
+    assert faulted.device_info("hp1").faulted is True
+    assert faulted.device_info("hp1").applied_mode is EquipmentMode.OFF
+    assert faulted.device_info("hp2").applied_mode is EquipmentMode.HEAT
+    assert faulted.device_info("hp2").delivered_kw == pytest.approx(4.5)
+    assert faulted.unmet_for("cold").reason == "capacity_exceeded"
+    assert faulted.unmet_for("cold").unmet_kw == pytest.approx(0.5)
+    assert faulted.unmet_for("hot").reason == "mode_conflict"
+
+
+def test_zero_budget_one_way_devices_blockers_order_and_restore(tmp_path):
+    """仅制冷 4.5kW / 仅制热 3.5kW：零预算、故障、启停保护、次序与重开。"""
+    rooms = direction_rooms()
+
+    def build(order, min_off=0.0, cap=0.0):
+        devices = {
+            "cooler": make_device("cooler", heat=0.0, cool=4.5),
+            "heater": make_device("heater", heat=3.5, cool=0.0, min_off=min_off),
+        }
+        schedule = PowerSchedule(segments=[(0.0, cap)])
+        return BuildingEngine(
+            rooms, [devices[key] for key in order], power_schedule=schedule
+        )
+
+    # 零预算：两种登记次序下设备都保持 OFF，欠供都是预算不足。
+    results = {}
+    for order in (("cooler", "heater"), ("heater", "cooler")):
+        engine = build(order)
+        ingest_all(engine, {"cold": 15.0, "hot": 31.0}, 0.0)
+        result = engine.tick(0.0)
+        assert result.device_info("cooler").applied_mode is EquipmentMode.OFF
+        assert result.device_info("heater").applied_mode is EquipmentMode.OFF
+        assert result.unmet_for("cold").reason == "power_limited"
+        assert result.unmet_for("hot").reason == "power_limited"
+        results[order] = {
+            a.room_id: a.allocated_kw for a in result.delivered
+        }
+    assert results[("cooler", "heater")] == results[("heater", "cooler")]
+
+    # 零预算下无该方向能力的房间仍记 no_capability，与预算不足区分。
+    cooler_only = BuildingEngine(
+        rooms,
+        [make_device("cooler", heat=0.0, cool=4.5)],
+        power_schedule=PowerSchedule(segments=[(0.0, 0.0)]),
+    )
+    ingest_all(cooler_only, {"cold": 15.0, "hot": 31.0}, 0.0)
+    one_way = cooler_only.tick(0.0)
+    assert one_way.unmet_for("cold").reason == "no_capability"
+    assert one_way.unmet_for("hot").reason == "power_limited"
+
+    # 预算恢复后故障 + 启停保护：两种阻止条件分别记账。
+    engine = build(("cooler", "heater"), min_off=300.0, cap=100.0)
+    ingest_all(engine, {"cold": 15.0, "hot": 31.0}, 0.0)
+    served = engine.tick(0.0)
+    assert served.device_info("cooler").applied_mode is EquipmentMode.COOL
+    assert served.device_info("heater").applied_mode is EquipmentMode.HEAT
+    heater = engine.devices[1]
+    heater.set_available(False, 60.0)
+    ingest_all(engine, {"cold": 15.0, "hot": 31.0}, 60.0)
+    faulted = engine.tick(60.0)
+    assert faulted.unmet_for("cold").reason == "equipment_faulted"
+    assert faulted.device_info("cooler").delivered_kw == pytest.approx(4.5)
+    heater.set_available(True, 70.0)
+    ingest_all(engine, {"cold": 15.0, "hot": 31.0}, 120.0)
+    waiting = engine.tick(120.0)
+    assert waiting.device_info("heater").applied_mode is EquipmentMode.OFF
+    assert waiting.unmet_for("cold").reason == "min_off_not_satisfied"
+    assert waiting.unmet_for("hot").unmet_kw == pytest.approx(0.5)
+
+    # 交换登记次序并保存重开：供给数量、方向与解释保持连续。
+    engine = build(("heater", "cooler"))
+    ingest_all(engine, {"cold": 15.0, "hot": 31.0}, 0.0)
+    engine.tick(0.0)
+    state_file = tmp_path / "state.json"
+    engine.save_state(state_file)
+
+    restored = BuildingEngine.restore(
+        state_file,
+        rooms,
+        [
+            make_device("heater", heat=3.5, cool=0.0),
+            make_device("cooler", heat=0.0, cool=4.5),
+        ],
+    )
+    ingest_all(restored, {"cold": 15.0, "hot": 31.0}, 60.0)
+    after = restored.tick(60.0)
+
+    continuous = build(("heater", "cooler"))
+    ingest_all(continuous, {"cold": 15.0, "hot": 31.0}, 0.0)
+    continuous.tick(0.0)
+    ingest_all(continuous, {"cold": 15.0, "hot": 31.0}, 60.0)
+    expected = continuous.tick(60.0)
+
+    actual_map = {a.room_id: (a.mode, a.allocated_kw) for a in after.delivered}
+    expected_map = {a.room_id: (a.mode, a.allocated_kw) for a in expected.delivered}
+    assert actual_map == expected_map
+    assert {u.room_id: u.reason for u in after.unmet} == {
+        u.room_id: u.reason for u in expected.unmet
+    }
+    assert after.device_info("heater").applied_mode is EquipmentMode.OFF
+    assert after.device_info("cooler").applied_mode is EquipmentMode.OFF
+    assert after.unmet_for("cold").reason == "power_limited"
+    assert after.unmet_for("hot").reason == "power_limited"
