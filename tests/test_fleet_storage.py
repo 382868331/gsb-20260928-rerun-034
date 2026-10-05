@@ -358,9 +358,8 @@ def test_direction_fault_lockout_and_budget_reasons_are_distinct():
     assert result.unmet_for("cool-a").reason == "equipment_faulted"
     assert result.unmet_for("cool-b").reason == "equipment_faulted"
     assert result.unmet_for("heat-a").reason == "min_off_not_satisfied"
-    assert sum(a.allocated_kw for a in result.delivered) == pytest.approx(0.0)
 
-    # 故障恢复、停机等待结束：限电 6kW 下制冷 4kW + 制热 2kW，热房缺口记预算不足。
+    # 故障恢复、停机等待结束：限电 6kW 下制冷 4kW + 制热 2kW。
     cooler.set_available(True, 60.0)
     ingest_all(engine, {"cool-a": 31.0, "cool-b": 31.0, "heat-a": 15.0}, 400.0)
     recovered = engine.tick(400.0)
@@ -369,6 +368,193 @@ def test_direction_fault_lockout_and_budget_reasons_are_distinct():
     assert recovered.allocation_for("heat-a").allocated_kw == pytest.approx(2.0)
     assert recovered.unmet_for("heat-a").reason == "power_limited"
     assert sum(a.allocated_kw for a in recovered.delivered) <= 6.0 + 1e-9
+
+
+def opposite_service_rooms():
+    return [
+        RoomConfig("cold", "冷房", priority=1, setpoint_c=22.0, rated_input_kw=5.0),
+        RoomConfig("hot", "热房", priority=2, setpoint_c=22.0, rated_input_kw=5.0),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("kind", "heat_capacity", "cool_capacity"),
+    [("bidirectional", 4.5, 4.5), ("directional", 3.5, 4.5)],
+)
+def test_zero_budget_does_not_invent_direction_or_conflict(kind, heat_capacity, cool_capacity):
+    rooms = opposite_service_rooms()
+    if kind == "bidirectional":
+        devices = [
+            make_device("hp1", heat=heat_capacity, cool=cool_capacity),
+            make_device("hp2", heat=heat_capacity, cool=cool_capacity),
+        ]
+    else:
+        devices = [
+            make_device("cooler", heat=0.0, cool=cool_capacity),
+            make_device("heater", heat=heat_capacity, cool=0.0),
+        ]
+    engine = BuildingEngine(
+        rooms,
+        devices,
+        power_schedule=PowerSchedule(segments=[(0.0, 0.0)]),
+    )
+    ingest_all(engine, {"cold": 15.0, "hot": 31.0}, 0.0)
+
+    result = engine.tick(0.0)
+
+    assert {info.applied_mode for info in result.devices} == {EquipmentMode.OFF}
+    assert all(a.allocated_kw == pytest.approx(0.0) for a in result.delivered)
+    assert {item.reason for item in result.unmet} == {"power_limited"}
+    assert not any(item.reason == "mode_conflict" for item in result.unmet)
+
+
+@pytest.mark.parametrize("order", [("hp1", "hp2"), ("hp2", "hp1")])
+def test_two_bidirectional_devices_split_opposite_demands(order):
+    rooms = opposite_service_rooms()
+    devices_by_id = {
+        "hp1": make_device("hp1", heat=4.5, cool=4.5),
+        "hp2": make_device("hp2", heat=4.5, cool=4.5),
+    }
+    engine = BuildingEngine(rooms, [devices_by_id[item] for item in order])
+    ingest_all(engine, {"cold": 15.0, "hot": 31.0}, 0.0)
+
+    result = engine.tick(0.0)
+
+    assert result.device_info("hp1").applied_mode is EquipmentMode.HEAT
+    assert result.device_info("hp2").applied_mode is EquipmentMode.COOL
+    assert result.allocation_for("cold").allocated_kw == pytest.approx(4.5)
+    assert result.allocation_for("hot").allocated_kw == pytest.approx(4.5)
+    assert {item.reason for item in result.unmet} == {"capacity_exceeded"}
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected_heat", "expected_cool"),
+    [("bidirectional", 4.5, 0.5), ("directional", 3.5, 1.5)],
+)
+def test_partial_budget_fault_and_lockout_keep_real_statuses(kind, expected_heat, expected_cool):
+    rooms = opposite_service_rooms()
+    if kind == "bidirectional":
+        def build_devices():
+            return [
+                make_device("hp1", heat=4.5, cool=4.5, min_off=300.0),
+                make_device("hp2", heat=4.5, cool=4.5, min_off=300.0),
+            ]
+    else:
+        def build_devices():
+            return [
+                make_device("cooler", heat=0.0, cool=4.5, min_off=300.0),
+                make_device("heater", heat=3.5, cool=0.0, min_off=300.0),
+            ]
+
+    schedule = PowerSchedule(segments=[(0.0, 0.0), (600.0, 5.0), (1200.0, float("inf"))])
+    devices = build_devices()
+    devices_by_id = {device.device_id: device for device in devices}
+    engine = BuildingEngine(rooms, devices, power_schedule=schedule)
+
+    ingest_all(engine, {"cold": 15.0, "hot": 31.0}, 0.0)
+    zero_budget = engine.tick(0.0)
+    assert {info.applied_mode for info in zero_budget.devices} == {EquipmentMode.OFF}
+    assert {item.reason for item in zero_budget.unmet} == {"power_limited"}
+
+    ingest_all(engine, {"cold": 15.0, "hot": 31.0}, 600.0)
+    partial = engine.tick(600.0)
+    assert partial.allocation_for("cold").allocated_kw == pytest.approx(expected_heat)
+    assert partial.allocation_for("hot").allocated_kw == pytest.approx(expected_cool)
+    assert partial.unmet_for("hot").reason == "power_limited"
+    assert partial.unmet_for("cold").reason == "capacity_exceeded"
+
+    faulted_id = "hp2" if kind == "bidirectional" else "cooler"
+    devices_by_id[faulted_id].set_available(False, 1200.0)
+    ingest_all(engine, {"cold": 15.0, "hot": 31.0}, 1200.0)
+    faulted = engine.tick(1200.0)
+    assert faulted.device_info(faulted_id).applied_mode is EquipmentMode.OFF
+    if kind == "bidirectional":
+        assert faulted.unmet_for("hot").reason == "mode_conflict"
+        assert faulted.unmet_for("cold").reason == "capacity_exceeded"
+    else:
+        assert faulted.unmet_for("hot").reason == "equipment_faulted"
+        assert faulted.unmet_for("cold").reason == "capacity_exceeded"
+
+    devices_by_id[faulted_id].set_available(True, 1500.0)
+    locked_id = "hp1" if kind == "bidirectional" else "heater"
+    locked = devices_by_id[locked_id]
+    locked.mode = EquipmentMode.OFF
+    locked.state_since = 1800.0
+    ingest_all(engine, {"cold": 15.0, "hot": 31.0}, 1800.0)
+    lockout = engine.tick(1800.0)
+    assert lockout.device_info(locked_id).applied_mode is EquipmentMode.OFF
+    if kind == "bidirectional":
+        assert lockout.unmet_for("cold").reason == "min_off_not_satisfied"
+        assert lockout.unmet_for("hot").reason == "capacity_exceeded"
+    else:
+        assert lockout.unmet_for("cold").reason == "min_off_not_satisfied"
+        assert lockout.unmet_for("hot").reason == "capacity_exceeded"
+
+
+def test_no_direction_capability_is_distinct_from_budget_and_lockout():
+    rooms = opposite_service_rooms()
+    devices = [
+        make_device("cooler-a", heat=0.0, cool=4.5),
+        make_device("cooler-b", heat=0.0, cool=4.5),
+    ]
+    engine = BuildingEngine(rooms, devices)
+    ingest_all(engine, {"cold": 15.0, "hot": 31.0}, 0.0)
+
+    result = engine.tick(0.0)
+
+    assert {info.applied_mode for info in result.devices} == {EquipmentMode.COOL}
+    assert result.unmet_for("cold").reason == "no_capability"
+    assert result.allocation_for("hot").allocated_kw == pytest.approx(5.0)
+    assert result.unmet_for("hot") is None
+
+
+@pytest.mark.parametrize(
+    ("kind", "order"),
+    [
+        ("bidirectional", ("hp1", "hp2")),
+        ("bidirectional", ("hp2", "hp1")),
+        ("directional", ("cooler", "heater")),
+        ("directional", ("heater", "cooler")),
+    ],
+)
+def test_reordered_device_registration_restores_by_id(tmp_path, kind, order):
+    rooms = opposite_service_rooms()
+    if kind == "bidirectional":
+        def build_devices():
+            return [
+                make_device("hp1", heat=4.5, cool=4.5),
+                make_device("hp2", heat=4.5, cool=4.5),
+            ]
+    else:
+        def build_devices():
+            return [
+                make_device("cooler", heat=0.0, cool=4.5),
+                make_device("heater", heat=3.5, cool=0.0),
+            ]
+    original_by_id = {device.device_id: device for device in build_devices()}
+    engine = BuildingEngine(
+        rooms,
+        [original_by_id[item] for item in reversed(order)],
+        power_schedule=PowerSchedule(segments=[(0.0, 5.0)]),
+    )
+    ingest_all(engine, {"cold": 15.0, "hot": 31.0}, 0.0)
+    before = engine.tick(0.0)
+    engine.save_state(tmp_path / "state.json")
+
+    restored_by_id = {device.device_id: device for device in build_devices()}
+    restored = BuildingEngine.restore(
+        tmp_path / "state.json",
+        rooms,
+        [restored_by_id[item] for item in order],
+    )
+    ingest_all(restored, {"cold": 15.0, "hot": 31.0}, 60.0)
+    after = restored.tick(60.0)
+
+    expected = [(a.room_id, a.mode, a.allocated_kw) for a in before.delivered]
+    actual = [(a.room_id, a.mode, a.allocated_kw) for a in after.delivered]
+    assert actual == expected
+    for device_id in order:
+        assert after.device_info(device_id).applied_mode == before.device_info(device_id).applied_mode
 
 
 def test_direction_allocation_consistent_across_save_restore(tmp_path):

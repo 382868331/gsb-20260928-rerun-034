@@ -187,23 +187,59 @@ class BuildingEngine:
         )
         demanded_modes = {room.demand for room in room_states if room.is_known_demand}
 
-        # 每台设备按自身方向能力选择目标模式：仅能单方向运行的设备服务对应
-        # 方向的房间；冷热双向设备在两侧都有需求时跟随全局仲裁胜者。
+        # 固定方向设备登记到对应需求；可用双向设备先覆盖不同方向，剩余再给
+        # 高优先级方向。两台可用双向设备可分别同时制热/制冷。
         assigned: dict[str, EquipmentMode] = {}
+        demanded_priorities = {
+            mode: min(
+                (room.config.priority for room in room_states if room.demand is mode),
+                default=10**9,
+            )
+            for mode in (Mode.HEAT, Mode.COOL)
+        }
+        demanded_modes_in_priority_order = sorted(
+            demanded_modes, key=lambda mode: demanded_priorities[mode]
+        )
         for device in self.devices:
-            capable = []
-            if device.spec.heating_capacity_kw > 0:
-                capable.append(EquipmentMode.HEAT)
-            if device.spec.cooling_capacity_kw > 0:
-                capable.append(EquipmentMode.COOL)
-            candidates = [m for m in capable if Mode(m.value) in demanded_modes]
-            if not any_valid_demand or not candidates:
-                target = EquipmentMode.OFF
-            elif len(candidates) == 1:
-                target = candidates[0]
-            else:
-                target = EquipmentMode(winner.value)
-            assigned[device.device_id] = target
+            capable = {
+                equipment_mode
+                for equipment_mode in (EquipmentMode.HEAT, EquipmentMode.COOL)
+                if device.capacity_kw(equipment_mode) > 0
+                and equipment_mode.demand() in demanded_modes
+            }
+            assigned[device.device_id] = (
+                next(iter(capable)) if len(capable) == 1 else EquipmentMode.OFF
+            )
+
+        bidirectional = sorted(
+            (
+                device
+                for device in self.devices
+                if device.available
+                and device.capacity_kw(EquipmentMode.HEAT) > 0
+                and device.capacity_kw(EquipmentMode.COOL) > 0
+            ),
+            key=lambda device: (
+                -max(
+                    device.capacity_kw(EquipmentMode.HEAT),
+                    device.capacity_kw(EquipmentMode.COOL),
+                ),
+                device.device_id,
+            ),
+        )
+        bidirectional_iter = iter(bidirectional)
+        for demand_mode in demanded_modes_in_priority_order:
+            equipment_mode = EquipmentMode(demand_mode.value)
+            if any(target is equipment_mode for target in assigned.values()):
+                continue
+            try:
+                device = next(bidirectional_iter)
+            except StopIteration:
+                continue
+            assigned[device.device_id] = equipment_mode
+        if winner in (Mode.HEAT, Mode.COOL):
+            for device in bidirectional_iter:
+                assigned[device.device_id] = EquipmentMode(winner.value)
 
         # 计划：按各方向被分配设备的额定能力分配，不考虑等待/故障/限电
         # （计划量 ≠ 实际交付）。没有任何设备被分配到某方向时，该方向
@@ -246,11 +282,76 @@ class BuildingEngine:
             desired, tuple(suppressed_allocations) + tuple(served_allocations), notes, tuple(plan_unmet)
         )
 
+        power_cap = self.power_schedule.cap_kw(current) if self.power_schedule else float("inf")
+
+        # 实际交付：设备当刻产出先供房间，富余能力给储能充电，缺口由储能放电补足。
+        demanding_rooms = sorted(
+            (room for room in room_states if room.is_known_demand),
+            key=lambda room: room.config.priority,
+        )
+        requests_by_mode = {
+            mode: sorted(
+                (room for room in room_states if room.is_known_demand and room.demand is mode),
+                key=lambda room: room.config.priority,
+            )
+            for mode in (Mode.HEAT, Mode.COOL)
+        }
+        requested_total_by_mode = {
+            mode: sum(room.requested_kw for room in requests_by_mode[mode])
+            for mode in (Mode.HEAT, Mode.COOL)
+        }
+
+        # 零预算不能产生“有方向、零出力”的设备状态。预算按房间优先级跨设备
+        # 分配，避免设备登记顺序影响实际供给。
+        remaining_power = max(0.0, power_cap)
+        remaining_request = dict(requested_total_by_mode)
+        device_budget_kw = {device.device_id: 0.0 for device in self.devices}
+        power_limited_modes: set[Mode] = set()
+        startable_devices = []
+        for device in self.devices:
+            target = assigned[device.device_id]
+            if (
+                target.running
+                and device.available
+                and (
+                    device.mode is target
+                    or (device.mode is EquipmentMode.OFF and device.can_start(current))
+                )
+            ):
+                startable_devices.append(device)
+        for device in sorted(
+            startable_devices,
+            key=lambda item: (
+                demanded_priorities[Mode(assigned[item.device_id].value)],
+                item.device_id,
+            ),
+        ):
+            target = assigned[device.device_id]
+            mode = Mode(target.value)
+            wanted = min(device.capacity_kw(target), remaining_request[mode])
+            budget = min(wanted, remaining_power)
+            if wanted > 1e-9 and budget < wanted - 1e-9:
+                power_limited_modes.add(mode)
+            device_budget_kw[device.device_id] = budget
+            remaining_power -= budget
+            remaining_request[mode] -= budget
+        for device in sorted(startable_devices, key=lambda item: item.device_id):
+            target = assigned[device.device_id]
+            spare_capacity = device.capacity_kw(target) - device_budget_kw[device.device_id]
+            spare_budget = min(spare_capacity, remaining_power)
+            device_budget_kw[device.device_id] += spare_budget
+            remaining_power -= spare_budget
         # 逐台设备执行模式切换：各自保留最短开/停等待，冷热不能直接互切。
         device_infos: list[DeviceTickInfo] = []
         for device in self.devices:
             previous = device.mode
             target = assigned[device.device_id]
+            if (
+                device.available
+                and target.running
+                and device_budget_kw[device.device_id] <= 1e-9
+            ):
+                target = EquipmentMode.OFF
             if previous.running and previous is not target:
                 target = EquipmentMode.OFF
             if device.allow(target, current):
@@ -265,48 +366,35 @@ class BuildingEngine:
                     delivered_kw=0.0,
                 )
             )
-
-        power_cap = self.power_schedule.cap_kw(current) if self.power_schedule else float("inf")
-
-        # 实际交付：设备当刻产出先供房间，富余能力给储能充电，缺口由储能放电补足。
-        # 每台设备只服务自己当前运行方向的房间，站点限电按登记顺序依次约束。
-        demanding_rooms = sorted(
-            (room for room in room_states if room.is_known_demand),
-            key=lambda room: room.config.priority,
-        )
-        requests_by_mode = {
-            mode: sorted(
-                (room for room in room_states if room.is_known_demand and room.demand is mode),
-                key=lambda room: room.config.priority,
-            )
-            for mode in (Mode.HEAT, Mode.COOL)
-        }
         room_device_kw = {room.room_id: 0.0 for room in demanding_rooms}
         device_output = {device.device_id: 0.0 for device in self.devices}
         charge_by_mode = {Mode.HEAT: 0.0, Mode.COOL: 0.0}
         discharge_by_mode = {Mode.HEAT: 0.0, Mode.COOL: 0.0}
         active_devices = [device for device in self.devices if device.available and device.mode.running]
-        remaining_power = power_cap
-        for device in active_devices:
-            run_mode = device.mode
-            demand_mode = Mode(run_mode.value)
-            budget = max(0.0, min(device.capacity_kw(run_mode), remaining_power))
-            remaining_power -= budget
-            used = 0.0
-            for room in requests_by_mode[demand_mode]:
+        device_remaining_budget = {
+            device.device_id: device_budget_kw[device.device_id] for device in active_devices
+        }
+        for room in demanding_rooms:
+            for device in sorted(
+                (item for item in active_devices if Mode(item.mode.value) is room.demand),
+                key=lambda item: (-item.capacity_kw(item.mode), item.device_id),
+            ):
                 need = room.requested_kw - room_device_kw[room.room_id]
-                if need <= 1e-9:
+                give = min(need, device_remaining_budget[device.device_id])
+                if give <= 1e-9:
                     continue
-                give = min(need, budget - used)
-                if give <= 0.0:
-                    break
                 room_device_kw[room.room_id] += give
-                used += give
-            if self.storage is not None and budget - used > 1e-9:
-                accepted = self.storage.charge(demand_mode, budget - used, dt_h)
+                device_remaining_budget[device.device_id] -= give
+                device_output[device.device_id] += give
+        if self.storage is not None:
+            for device in active_devices:
+                leftover = device_remaining_budget[device.device_id]
+                if leftover <= 1e-9:
+                    continue
+                demand_mode = Mode(device.mode.value)
+                accepted = self.storage.charge(demand_mode, leftover, dt_h)
                 charge_by_mode[demand_mode] += accepted
-                used += accepted
-            device_output[device.device_id] = used
+                device_output[device.device_id] += accepted
 
         room_storage_kw = {room.room_id: 0.0 for room in demanding_rooms}
         reserve_floors = {
@@ -335,7 +423,7 @@ class BuildingEngine:
 
         unmet = self._unmet(
             room_states, assigned, delivered_map, active_devices,
-            device_output, power_cap, reserve_floors,
+            reserve_floors, power_limited_modes,
         )
 
         running_modes = [
@@ -415,19 +503,10 @@ class BuildingEngine:
         assigned: dict[str, EquipmentMode],
         delivered_map: dict[str, float],
         active_devices: list[HeatPump],
-        device_output: dict[str, float],
-        power_cap_kw: float,
         reserve_floors: dict[Mode, float],
+        power_limited_modes: set[Mode],
     ) -> tuple[UnmetDemand, ...]:
         unmet: list[UnmetDemand] = []
-        total_active_capacity = sum(
-            device.capacity_kw(device.mode) for device in active_devices
-        )
-        power_limited = (
-            bool(active_devices)
-            and power_cap_kw < total_active_capacity - 1e-9
-            and abs(sum(device_output.values()) - power_cap_kw) < 1e-6
-        )
 
         def storage_withheld(mode: Mode) -> bool:
             return (
@@ -463,10 +542,12 @@ class BuildingEngine:
             elif not active:
                 if all(device.faulted for device in serving):
                     reason = "equipment_faulted"
+                elif room.demand in power_limited_modes:
+                    reason = "power_limited"
                 else:
                     # 受最短开/停保护，本周期不能切换到位。
                     reason = "min_off_not_satisfied"
-            elif power_limited:
+            elif room.demand in power_limited_modes:
                 reason = "power_limited"
             elif storage_withheld(room.demand):
                 reason = "storage_reserve_held"
@@ -497,7 +578,14 @@ class BuildingEngine:
     def load_state(self, path: str | Path) -> None:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
         snapshots = payload.get("devices") or [payload["equipment"]]
-        for device, snapshot in zip(self.devices, snapshots):
+        snapshots_by_id = {
+            str(snapshot.get("device_id")): snapshot for snapshot in snapshots
+        }
+        for index, device in enumerate(self.devices):
+            fallback = snapshots[index] if index < len(snapshots) else None
+            snapshot = snapshots_by_id.get(device.device_id, fallback)
+            if snapshot is None:
+                continue
             device.restore(snapshot)
         self.sensors.restore(payload.get("readings", {}))
         if self.storage is not None and payload.get("storage"):
